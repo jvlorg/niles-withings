@@ -89,6 +89,134 @@ const MAT: &str =
     r#"{"deviceid":"synthetic-mat","type":"Sleep Monitor","model":"Aura Sensor","model_id":61}"#;
 
 #[test]
+fn coordinator_account_switch_stale_generation_and_failed_save() {
+    use niles_withings::{
+        application::WebhookRequest,
+        coordinator::{Coordinator, SetupStatus},
+    };
+    let mut owner = Coordinator::<StateStore, Events>::default();
+    let request = |user| WebhookRequest {
+        method: "POST".into(),
+        content_type: "application/x-www-form-urlencoded".into(),
+        body: format!("userid={user}&deviceid=synthetic-mat&appli=50&date=1001").into_bytes(),
+    };
+    let mut selections = Selections::default();
+    let mut transport = Transport {
+        replies: [
+            devices(MAT),
+            devices(MAT),
+            devices(MAT),
+            devices(MAT),
+            devices(""),
+        ]
+        .into(),
+        calls: 0,
+    };
+    owner.begin_account(Some(123));
+    owner
+        .discover(&mut transport, &mut selections, &record(123), 1001)
+        .unwrap();
+    let old = owner.generation();
+    owner
+        .discover(&mut transport, &mut selections, &record(123), 1001)
+        .unwrap();
+    assert!(
+        owner
+            .accept(
+                &mut selections,
+                "synthetic-mat",
+                old,
+                StateStore::default(),
+                Events::default()
+            )
+            .is_err()
+    );
+    assert!(selections.value.is_none());
+    selections.fail_save = true;
+    assert!(
+        owner
+            .accept(
+                &mut selections,
+                "synthetic-mat",
+                owner.generation(),
+                StateStore::default(),
+                Events::default()
+            )
+            .is_err()
+    );
+    assert_eq!(owner.webhook(&request(123), 1001, 0, 0).status, 503);
+    selections.fail_save = false;
+    owner
+        .accept(
+            &mut selections,
+            "synthetic-mat",
+            owner.generation(),
+            StateStore::default(),
+            Events::default(),
+        )
+        .unwrap();
+    assert_eq!(owner.webhook(&request(123), 1001, 0, 0).status, 200);
+    owner.set_lifecycle(niles_withings::lifecycle::Status::Ready);
+    owner.begin_account(Some(123));
+    assert_eq!(owner.status(), SetupStatus::Configured);
+    owner.begin_account(Some(999));
+    assert_eq!(owner.webhook(&request(123), 1001, 0, 0).status, 503);
+    assert!(
+        owner
+            .activate(
+                &mut selections,
+                999,
+                StateStore::default(),
+                Events::default()
+            )
+            .is_err()
+    );
+    owner
+        .discover(&mut transport, &mut selections, &record(999), 1001)
+        .unwrap();
+    owner
+        .accept(
+            &mut selections,
+            "synthetic-mat",
+            owner.generation(),
+            StateStore::default(),
+            Events::default(),
+        )
+        .unwrap();
+    assert_eq!(owner.webhook(&request(123), 1001, 0, 0).status, 400);
+    assert_eq!(owner.webhook(&request(999), 1001, 0, 0).status, 200);
+    owner
+        .discover(&mut transport, &mut selections, &record(999), 1001)
+        .unwrap();
+    owner
+        .activate(
+            &mut selections,
+            999,
+            StateStore::default(),
+            Events::default(),
+        )
+        .unwrap();
+    owner
+        .discover(&mut transport, &mut selections, &record(999), 1001)
+        .unwrap();
+    assert_eq!(owner.status(), SetupStatus::SelectionStale);
+    assert!(
+        owner
+            .activate(
+                &mut selections,
+                999,
+                StateStore::default(),
+                Events::default()
+            )
+            .is_err()
+    );
+    assert_eq!(owner.webhook(&request(999), 1001, 0, 0).status, 503);
+    owner.begin_account(None);
+    owner.discovery_failed();
+    assert_eq!(owner.status(), SetupStatus::AccountRequired);
+}
+
+#[test]
 fn selection_is_explicit_durable_and_gates_adapter_events() {
     let mut transport = Transport {
         replies: std::collections::VecDeque::from([devices(MAT), devices(MAT)]),
