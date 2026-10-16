@@ -10,6 +10,61 @@ use crate::{
 };
 use std::marker::PhantomData;
 
+/// A host-provided key/value backend. The coordinator supplies the complete,
+/// versioned account/device key; implementations must not reinterpret it.
+pub trait ScopedBackend {
+    type Error: std::fmt::Display;
+    fn load_value(&mut self, key: &str) -> Result<Option<String>, Self::Error>;
+    fn save_value(&mut self, key: &str, value: &str) -> Result<(), Self::Error>;
+}
+
+/// Versioned, collision-free storage identity. Byte-length prefixes preserve
+/// exact UTF-8 identity boundaries without embedding credentials or tokens.
+pub fn presence_namespace(account: &str, device: &str) -> Result<String, &'static str> {
+    if account.is_empty()
+        || device.is_empty()
+        || account.len() > 128
+        || device.len() > 128
+        || account.bytes().any(|b| b.is_ascii_control())
+        || device.bytes().any(|b| b.is_ascii_control())
+    {
+        return Err("invalid presence identity");
+    }
+    Ok(format!(
+        "niles-withings:presence:v1:{}:{account}:{}:{device}",
+        account.len(),
+        device.len()
+    ))
+}
+
+pub struct ScopedStore<B> {
+    backend: B,
+    key: String,
+}
+impl<B> ScopedStore<B> {
+    pub fn new(backend: B, account: &str, device: &str) -> Result<Self, &'static str> {
+        Ok(Self {
+            backend,
+            key: presence_namespace(account, device)?,
+        })
+    }
+    pub fn into_backend(self) -> B {
+        self.backend
+    }
+    pub fn key(&self) -> &str {
+        &self.key
+    }
+}
+impl<B: ScopedBackend> Store for ScopedStore<B> {
+    type Error = B::Error;
+    fn load(&mut self) -> Result<Option<String>, Self::Error> {
+        self.backend.load_value(&self.key)
+    }
+    fn save(&mut self, state: &str) -> Result<(), Self::Error> {
+        self.backend.save_value(&self.key, state)
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SetupStatus {
     AccountRequired,
@@ -28,6 +83,7 @@ pub struct Coordinator<S: Store, H: Sink> {
     binding: Option<Binding>,
     setup: SetupStatus,
     lifecycle_ready: bool,
+    choosing: bool,
     marker: PhantomData<(S, H)>,
 }
 impl<S: Store, H: Sink> Default for Coordinator<S, H> {
@@ -40,10 +96,59 @@ impl<S: Store, H: Sink> Default for Coordinator<S, H> {
             binding: None,
             setup: SetupStatus::AccountRequired,
             lifecycle_ready: false,
+            choosing: false,
             marker: PhantomData,
         }
     }
 }
+impl<B: ScopedBackend, H: Sink> Coordinator<ScopedStore<B>, H> {
+    pub fn accept_scoped<P: SelectionStore>(
+        &mut self,
+        store: &mut P,
+        device_id: &str,
+        expected_generation: u64,
+        backend: B,
+        sink: H,
+    ) -> Result<(), application::ApplicationError> {
+        let account = self
+            .account
+            .ok_or(application::ApplicationError::InvalidSelection)?;
+        if expected_generation != self.generation {
+            return Err(application::ApplicationError::InvalidSelection);
+        }
+        let key = presence_namespace(&account.to_string(), device_id)
+            .map_err(|_| application::ApplicationError::InvalidSelection)?;
+        self.accept(
+            store,
+            device_id,
+            expected_generation,
+            ScopedStore { backend, key },
+            sink,
+        )
+    }
+    pub fn activate_scoped<P: SelectionStore>(
+        &mut self,
+        store: &mut P,
+        account: u64,
+        backend: B,
+        sink: H,
+    ) -> Result<(), application::ApplicationError> {
+        let device = match self.discovered.as_ref() {
+            Some((generation, SetupResolution::Selected(binding)))
+                if *generation == self.generation
+                    && self.account == Some(account)
+                    && binding.identity().user_id == account.to_string() =>
+            {
+                binding.identity().device_id
+            }
+            _ => return Err(application::ApplicationError::InvalidSelection),
+        };
+        let scoped = ScopedStore::new(backend, &account.to_string(), &device)
+            .map_err(|_| application::ApplicationError::InvalidSelection)?;
+        self.activate(store, account, scoped, sink)
+    }
+}
+
 impl<S: Store, H: Sink> Coordinator<S, H> {
     pub fn status(&self) -> SetupStatus {
         self.setup
@@ -63,6 +168,7 @@ impl<S: Store, H: Sink> Coordinator<S, H> {
             self.lifecycle_ready = false;
             self.generation = self.generation.wrapping_add(1);
         }
+        self.choosing = false;
         self.account = account;
         self.setup = if account.is_some() {
             SetupStatus::SelectionNeeded
@@ -71,6 +177,7 @@ impl<S: Store, H: Sink> Coordinator<S, H> {
         };
     }
     pub fn switch_device(&mut self) {
+        self.choosing = true;
         self.adapter = None;
         self.binding = None;
         self.discovered = None;
@@ -109,7 +216,27 @@ impl<S: Store, H: Sink> Coordinator<S, H> {
         self.binding = None;
         self.lifecycle_ready = false;
         self.generation = self.generation.wrapping_add(1);
-        let result = match application::setup_discover(transport, store, record, account, now) {
+        struct View<'a, P>(&'a mut P, bool);
+        impl<P: SelectionStore> SelectionStore for View<'_, P> {
+            type Error = P::Error;
+            fn load_selection(&mut self) -> Result<Option<String>, Self::Error> {
+                if self.1 {
+                    Ok(None)
+                } else {
+                    self.0.load_selection()
+                }
+            }
+            fn save_selection(&mut self, s: &str) -> Result<(), Self::Error> {
+                self.0.save_selection(s)
+            }
+        }
+        let result = match application::setup_discover(
+            transport,
+            &mut View(store, self.choosing),
+            record,
+            account,
+            now,
+        ) {
             Ok(result) => result,
             Err(error) => {
                 self.discovered = None;
@@ -130,7 +257,7 @@ impl<S: Store, H: Sink> Coordinator<S, H> {
         self.discovered = Some((self.generation, result));
         Ok(self.setup)
     }
-    pub fn accept<P: SelectionStore>(
+    fn accept<P: SelectionStore>(
         &mut self,
         store: &mut P,
         device_id: &str,
@@ -154,6 +281,7 @@ impl<S: Store, H: Sink> Coordinator<S, H> {
         let binding = application::accept_selection(store, account, discovery, device_id)?;
         let adapter = application::adapter_from_binding(&binding, sink_store, sink)
             .map_err(|_| application::ApplicationError::Delivery)?;
+        self.choosing = false;
         self.binding = Some(binding);
         self.adapter = Some(adapter);
         self.setup = SetupStatus::SubscriptionPending;
@@ -162,7 +290,7 @@ impl<S: Store, H: Sink> Coordinator<S, H> {
         Ok(())
     }
     /// Attach the adapter only after durable selection has been read back and account-bound.
-    pub fn activate<P: SelectionStore>(
+    fn activate<P: SelectionStore>(
         &mut self,
         store: &mut P,
         account: u64,
@@ -194,6 +322,7 @@ impl<S: Store, H: Sink> Coordinator<S, H> {
         }
         let adapter = application::adapter_from_binding(&binding, sink_store, sink)
             .map_err(|_| application::ApplicationError::Delivery)?;
+        self.choosing = false;
         self.binding = Some(binding);
         self.adapter = Some(adapter);
         self.setup = SetupStatus::SubscriptionPending;

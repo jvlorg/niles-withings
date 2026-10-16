@@ -53,6 +53,15 @@ impl Store for StateStore {
         Ok(())
     }
 }
+impl niles_withings::coordinator::ScopedBackend for StateStore {
+    type Error = &'static str;
+    fn load_value(&mut self, _: &str) -> Result<Option<String>, Self::Error> {
+        self.load()
+    }
+    fn save_value(&mut self, _: &str, value: &str) -> Result<(), Self::Error> {
+        self.save(value)
+    }
+}
 #[derive(Default)]
 struct Events {
     actions: Vec<&'static str>,
@@ -85,6 +94,171 @@ fn devices(rows: &str) -> HttpResponse {
         body: format!(r#"{{"status":0,"body":{{"devices":[{rows}]}}}}"#).into_bytes(),
     }
 }
+#[derive(Clone, Default)]
+struct Shared(std::rc::Rc<std::cell::RefCell<Ledger>>);
+#[derive(Default)]
+struct Ledger {
+    values: std::collections::BTreeMap<String, String>,
+    actions: Vec<&'static str>,
+    readings: Vec<Reading>,
+    fail_load: bool,
+    fail_save: bool,
+}
+impl niles_withings::coordinator::ScopedBackend for Shared {
+    type Error = &'static str;
+    fn load_value(&mut self, k: &str) -> Result<Option<String>, Self::Error> {
+        let d = self.0.borrow();
+        if d.fail_load {
+            Err("load")
+        } else {
+            Ok(d.values.get(k).cloned())
+        }
+    }
+    fn save_value(&mut self, k: &str, v: &str) -> Result<(), Self::Error> {
+        let mut d = self.0.borrow_mut();
+        if d.fail_save {
+            return Err("save");
+        };
+        d.values.insert(k.into(), v.into());
+        Ok(())
+    }
+}
+impl Sink for Shared {
+    type Error = &'static str;
+    fn publish_reading(&mut self, r: Reading) -> Result<(), Self::Error> {
+        self.0.borrow_mut().readings.push(r);
+        Ok(())
+    }
+    fn publish_action(&mut self, a: &'static str) -> Result<(), Self::Error> {
+        self.0.borrow_mut().actions.push(a);
+        Ok(())
+    }
+}
+#[test]
+fn coordinator_scopes_mat_switch_restart_and_failures() {
+    use niles_withings::{
+        application::WebhookRequest,
+        coordinator::{Coordinator, ScopedStore, presence_namespace},
+    };
+    let shared = Shared::default();
+    let mut selections = Selections::default();
+    let mut owner = Coordinator::<ScopedStore<Shared>, Shared>::default();
+    let rows = format!("{MAT},{}", MAT.replace("synthetic-mat", "matB"));
+    let mut transport = Transport {
+        replies: (0..8).map(|_| devices(&rows)).collect(),
+        calls: 0,
+    };
+    let event = |user, mat, appli, date| WebhookRequest {
+        method: "POST".into(),
+        content_type: "application/x-www-form-urlencoded".into(),
+        body: format!("userid={user}&deviceid={mat}&appli={appli}&date={date}").into_bytes(),
+    };
+    owner.begin_account(Some(123));
+    for mat in ["synthetic-mat", "matB", "synthetic-mat"] {
+        owner.switch_device();
+        assert_eq!(
+            owner.webhook(&event(123, mat, 50, 1001), 1001, 0, 0).status,
+            503
+        );
+        owner
+            .discover(&mut transport, &mut selections, &record(123), 1001)
+            .unwrap();
+        owner
+            .accept_scoped(
+                &mut selections,
+                mat,
+                owner.generation(),
+                shared.clone(),
+                shared.clone(),
+            )
+            .unwrap();
+        assert_eq!(
+            owner.webhook(&event(123, mat, 50, 1001), 1001, 0, 0).status,
+            200
+        );
+    }
+    assert_eq!(shared.0.borrow().actions, vec!["bed_in", "bed_in"]);
+    assert!(matches!(
+        shared.0.borrow().readings.last(),
+        Some(Reading::Unknown { .. })
+    ));
+    assert_eq!(
+        owner
+            .webhook(&event(123, "synthetic-mat", 51, 1002), 1002, 0, 0)
+            .status,
+        200
+    );
+    let key_a = presence_namespace("123", "synthetic-mat").unwrap();
+    let key_b = presence_namespace("123", "matB").unwrap();
+    let preserved = shared.0.borrow().values.clone();
+    assert_eq!(preserved.len(), 2);
+    assert!(preserved.contains_key(&key_a) && preserved.contains_key(&key_b));
+    drop(owner);
+    let mut owner = Coordinator::<ScopedStore<Shared>, Shared>::default();
+    owner.begin_account(Some(123));
+    owner
+        .discover(&mut transport, &mut selections, &record(123), 1002)
+        .unwrap();
+    shared.0.borrow_mut().fail_load = true;
+    assert!(
+        owner
+            .activate_scoped(&mut selections, 123, shared.clone(), shared.clone())
+            .is_err()
+    );
+    assert_eq!(
+        owner
+            .webhook(&event(123, "synthetic-mat", 51, 1002), 1002, 0, 0)
+            .status,
+        503
+    );
+    shared.0.borrow_mut().fail_load = false;
+    owner
+        .activate_scoped(&mut selections, 123, shared.clone(), shared.clone())
+        .unwrap();
+    assert_eq!(
+        owner
+            .webhook(&event(123, "synthetic-mat", 51, 1002), 1002, 0, 0)
+            .status,
+        200
+    );
+    assert!(matches!(
+        shared.0.borrow().readings.last(),
+        Some(Reading::Unknown { .. })
+    ));
+    shared.0.borrow_mut().fail_save = true;
+    assert_eq!(
+        owner
+            .webhook(&event(123, "synthetic-mat", 50, 1003), 1003, 0, 0)
+            .status,
+        503
+    );
+    assert_eq!(shared.0.borrow().values, preserved);
+    shared.0.borrow_mut().fail_save = false;
+    owner.begin_account(Some(999));
+    owner
+        .discover(&mut transport, &mut selections, &record(999), 1003)
+        .unwrap();
+    owner
+        .accept_scoped(
+            &mut selections,
+            "synthetic-mat",
+            owner.generation(),
+            shared.clone(),
+            shared.clone(),
+        )
+        .unwrap();
+    assert_eq!(
+        owner
+            .webhook(&event(999, "synthetic-mat", 50, 1003), 1003, 0, 0)
+            .status,
+        200
+    );
+    let d = shared.0.borrow();
+    assert_eq!(d.values.len(), 3);
+    assert_eq!(d.values[&key_a], preserved[&key_a]);
+    assert_eq!(d.values[&key_b], preserved[&key_b]);
+    assert_eq!(d.actions, vec!["bed_in", "bed_in", "bed_out", "bed_in"]);
+}
 const MAT: &str =
     r#"{"deviceid":"synthetic-mat","type":"Sleep Monitor","model":"Aura Sensor","model_id":61}"#;
 
@@ -94,7 +268,8 @@ fn coordinator_account_switch_stale_generation_and_failed_save() {
         application::WebhookRequest,
         coordinator::{Coordinator, SetupStatus},
     };
-    let mut owner = Coordinator::<StateStore, Events>::default();
+    let mut owner =
+        Coordinator::<niles_withings::coordinator::ScopedStore<StateStore>, Events>::default();
     let request = |user| WebhookRequest {
         method: "POST".into(),
         content_type: "application/x-www-form-urlencoded".into(),
@@ -122,7 +297,7 @@ fn coordinator_account_switch_stale_generation_and_failed_save() {
         .unwrap();
     assert!(
         owner
-            .accept(
+            .accept_scoped(
                 &mut selections,
                 "synthetic-mat",
                 old,
@@ -135,7 +310,7 @@ fn coordinator_account_switch_stale_generation_and_failed_save() {
     selections.fail_save = true;
     assert!(
         owner
-            .accept(
+            .accept_scoped(
                 &mut selections,
                 "synthetic-mat",
                 owner.generation(),
@@ -147,7 +322,7 @@ fn coordinator_account_switch_stale_generation_and_failed_save() {
     assert_eq!(owner.webhook(&request(123), 1001, 0, 0).status, 503);
     selections.fail_save = false;
     owner
-        .accept(
+        .accept_scoped(
             &mut selections,
             "synthetic-mat",
             owner.generation(),
@@ -163,7 +338,7 @@ fn coordinator_account_switch_stale_generation_and_failed_save() {
     assert_eq!(owner.webhook(&request(123), 1001, 0, 0).status, 503);
     assert!(
         owner
-            .activate(
+            .activate_scoped(
                 &mut selections,
                 999,
                 StateStore::default(),
@@ -175,7 +350,7 @@ fn coordinator_account_switch_stale_generation_and_failed_save() {
         .discover(&mut transport, &mut selections, &record(999), 1001)
         .unwrap();
     owner
-        .accept(
+        .accept_scoped(
             &mut selections,
             "synthetic-mat",
             owner.generation(),
@@ -189,7 +364,7 @@ fn coordinator_account_switch_stale_generation_and_failed_save() {
         .discover(&mut transport, &mut selections, &record(999), 1001)
         .unwrap();
     owner
-        .activate(
+        .activate_scoped(
             &mut selections,
             999,
             StateStore::default(),
@@ -202,7 +377,7 @@ fn coordinator_account_switch_stale_generation_and_failed_save() {
     assert_eq!(owner.status(), SetupStatus::SelectionStale);
     assert!(
         owner
-            .activate(
+            .activate_scoped(
                 &mut selections,
                 999,
                 StateStore::default(),
@@ -214,6 +389,25 @@ fn coordinator_account_switch_stale_generation_and_failed_save() {
     owner.begin_account(None);
     owner.discovery_failed();
     assert_eq!(owner.status(), SetupStatus::AccountRequired);
+}
+
+#[test]
+fn coordinator_scoped_presence_namespace_encoding_is_unambiguous_and_validated() {
+    use niles_withings::coordinator::presence_namespace;
+    assert_eq!(
+        presence_namespace("12", "3").unwrap(),
+        "niles-withings:presence:v1:2:12:1:3"
+    );
+    assert_eq!(
+        presence_namespace("1", "23").unwrap(),
+        "niles-withings:presence:v1:1:1:2:23"
+    );
+    assert_ne!(
+        presence_namespace("12", "3").unwrap(),
+        presence_namespace("1", "23").unwrap()
+    );
+    assert!(presence_namespace("", "matA").is_err());
+    assert!(presence_namespace("123", "bad\nmat").is_err());
 }
 
 #[test]
