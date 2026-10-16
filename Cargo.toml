@@ -1,0 +1,23 @@
+[package]
+name = "niles-withings"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "niles_withings"
+path = "src/lib.rs"
+
+[[bin]]
+name = "withings-replay"
+path = "src/bin/withings-replay.rs"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[dev-dependencies]
+tempfile = "3"
+
+[workspace]
+members = ["component"]
+resolver = "2"

@@ -1,6 +1,6 @@
 # Withings V1 architecture and evidence
 
-Research/design only; no add-on implementation or live account proof. Main reviewed and corrected worker research on 2026-10-16.
+Architecture research plus locally implemented synthetic delivery foundation; no live account proof. Main reviewed and corrected worker research on 2026-10-16.
 
 ## Product boundary
 
@@ -59,18 +59,17 @@ Niles provides generic bounded callback routing, endpoint lifecycle, secure muta
 
 Deployment context: existing Niles `home.johanleth.dk` is already behind the project-server Cloudflare Tunnel. Reuse that ingress if the host can expose narrowly scoped callback routes without weakening normal application authentication. Route behavior/reachability needs separate approved proof; this research has not changed the tunnel or server.
 
-## State/event contract to implement and prove
+## Executable V1 foundation (implemented locally)
 
-- Identify the actual profile/device. Use a stable plugin-owned Niles ID, not last reporter wins across mats.
-- Model unknown, in-bed and out-of-bed. Keep observed event time and transport/subscription status separate. Unknown is never an out-of-bed event.
-- Proposed automation actions: `bed_in` and `bed_out` through existing `devices.report-action`, emitted only on accepted fresh transitions. State readings provide current known status; exact numeric reading/unknown mapping must be proved against Niles automation/UI contracts before acceptance.
-- Persist bounded event cursor/dedup metadata. Same-direction repeats do not retrigger. Older events cannot undo newer state. Equal-time conflicting events are ambiguous, not resolved by arbitrary arrival order.
-- Provider events can be delayed/retried. Reject delayed action replay using an explicitly chosen age policy while retaining diagnostics; timestamps alone cannot detect every missed event or establish present occupancy. The age threshold needs product approval and measured delivery, not an invented guarantee.
-- Startup never emits a transition from restored state. A historical last-known state is not newly confirmed current presence. Without an authoritative reconciliation path, expose uncertainty until a fresh acceptable event.
-- Silence during a long sleep is not an outage heartbeat. Do not expire normal occupied state into absent on an arbitrary timer. Known auth/subscription failure may mark status uncertain without emitting bed_out.
-- No body-weight announcements, raw health/token logs, access tokens in callback URLs or unsecured refresh-token persistence.
+The repository now contains a Rust core library and offline replay CLI. `provider::parse` bounds input to 4096 bytes, decodes `application/x-www-form-urlencoded`, rejects duplicate required keys, accepts only categories 50/51 and requires exact configured user/device identity. The caller injects a deterministic current timestamp plus explicit maximum-age/future-skew thresholds. Errors are categorical and do not include request bodies or field contents. `presence::State` begins unknown, persists/restores bounded dedup metadata, emits the first fresh observed direction as an action, suppresses repeats/older events, marks conflicting equal-time directions uncertain, and never expires presence due to silence.
 
-## Remaining gates
+The host-neutral `adapter` invokes the shared parser and state reducer, persists candidate transitions before emitting mapped occupancy readings/actions, and accepts injected store/sink traits. Persistence errors leave in-memory state untouched and emit nothing. If a committed event's reading or action sink fails, the event remains committed and duplicate delivery does not retry the missing publication; this is at-most-once attempt behavior, not reliable delivery or exactly-once. Unknown is represented distinctly from known occupied=false and carries an optional observation timestamp; known occupancy carries its timestamp. Adapter tests use fake storage and sinks, not a host callback.
+
+Niles WIT provenance: `component/wit/niles-integration.wit` is from MarkNygaard/niles commit `457821d5b210f8005b42868ad6786687bbcf248c`, `schemas/niles-integration.wit` (package 0.2.1, requires Niles 0.2.1+). The built component passed Niles 0.2.1 `plugin check` and `plugin dev` using synthetic settings; observed status was Working while its status tool and UI explicitly said disconnected. The host run registered `x_withings:bedroom/presence` as a Sensor, which was unavailable because no occupancy report had occurred. The component validates a configurable room. The build script emits development-only manifest+Wasm, not a release/production install artifact.
+
+Official Withings references: [notification categories/payload](https://developer.withings.com/developer-guide/v3/data-api/notifications/notification-content), [subscription and URL requirements](https://developer.withings.com/developer-guide/v3/data-api/notifications/notification-subscribe), [transport/retries/latency](https://developer.withings.com/developer-guide/v3/data-api/notifications/notification-overview/).
+
+## Remaining acceptance gates
 
 1. Mark's generic callback contract plus secure rotating-secret solution, reviewed against existing interface compatibility.
 2. OAuth app setup, least-scope consent and account eligibility; no account access performed. Official portal currently states new free-plan accounts from October 12, 2026 need Withings+, older accounts unaffected; verify actual account.

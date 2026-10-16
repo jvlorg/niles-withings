@@ -1,0 +1,36 @@
+id = "withings"
+name = "Withings"
+version = "0.1.0"
+authors = ["Johan Volmers Leth"]
+description = "Withings Sleep bed-presence status; callback support is not yet available."
+keywords = ["withings", "bed", "sleep", "presence"]
+min_niles = "0.2.1"
+interface = "0.2"
+
+[permissions]
+devices = true
+tools = true
+ui = true
+
+[[settings]]
+key = "user_id"
+label = "Withings user ID"
+type = "string"
+required = true
+
+[[settings]]
+key = "device_id"
+label = "Sleep device ID"
+type = "string"
+required = true
+
+[[settings]]
+key = "room"
+label = "Bed room"
+type = "room"
+required = true
+
+[[ui.menu]]
+id = "withings"
+label = "Withings"
+icon = "bed"

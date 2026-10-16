@@ -1,0 +1,16 @@
+[package]
+name = "niles-withings-component"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+niles-withings = { path = ".." }
+wit-bindgen = "0.41"
+
+[[package.metadata.niles]]
+name = "withings"
+version = "0.1.0"
+wit = "wit/niles-integration.wit"

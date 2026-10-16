@@ -1,11 +1,27 @@
 # Niles Withings
 
-Research and design package for a standalone Niles Withings add-on.
+Rust executable foundation for a standalone Niles Withings Sleep bed-presence add-on. Scope is in-bed / out-of-bed only; in-bed does not mean asleep. Historical sleep is V2; Body+ remains secondary and not yet implemented.
 
-## Product scope
+## Implemented locally
 
-V1 is Withings Sleep in-bed / out-of-bed state, with events usable by Niles automations. “In bed” is not a claim that someone is asleep. Historical sleep reports and analysis are V2. Body+ is secondary and only in scope if its distinct data/notification path proves straightforward; do not assume it shares the Sleep notification.
+- Bounded Rust form parser for official categories 50 (bed in) / 51 (bed out), required user/device/date isolation, strict duplicate required-key rejection and form percent decoding.
+- Deterministic-age-filtered presence reducer, Unknown/InBed/OutOfBed state, health distinct from observation, restart serialization, bounded dedup/cursor and conservative transition policy.
+- Offline synthetic replay CLI exercising parser/state and restart round trips.
+- Host-neutral delivery adapter around the same parser and state, with injected durable store and sink. It commits changed state before publishing readings/actions. Failed reading/action publication is not retried after commit; this is at-most-once attempt behavior, not reliable delivery or exactly-once.
+- Niles component setup validates user/device and a configurable room, registers a room-scoped sensor, and exposes a truthful disconnected status surface/tool. WIT is vendored at `component/wit/niles-integration.wit` (package 0.2.1; requires Niles 0.2.1+).
 
-## Status
+The local Niles 0.2.1 checker and stand-in dev host (binary source commit not independently established) have now accepted and run this component offline; reproducible command: `scripts/verify-niles-host.sh <niles-0.2.1-cli> <absolute-scratch-output>`. This uses only the CLI checker and `plugin dev` synthetic settings, with no account/API connection or provider writes. The artifact remains development-only, not a release/production install.
 
-Research/design only. No production code, Withings account access, live API validation, OAuth consent, callback registration, deployment, or release has been performed. Official bed-event categories, scopes, example payloads and callback transport are documented; household end-to-end operation remains unproven. See [the plan](docs/plan.md), [architecture and evidence](docs/architecture.md) and [the draft generic Niles core request](docs/niles-core-request.md). The current inspected host lacks incoming add-on callbacks; secure runtime token persistence also needs agreement.
+## Local commands
+
+```text
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace
+cargo run --bin withings-replay -- /absolute/path/to/new-synthetic-state.json
+scripts/build-development.sh /absolute/path/to/development-output
+```
+
+All fixtures are synthetic; no listener, account, provider write, deployment or live service interaction is included. The development artifact passes the local host checker and dev-host initialization; this is not production installation or Withings connectivity proof. See [architecture and evidence](docs/architecture.md) and [implementation plan](docs/plan.md).
+
+Official provider references: [notification content](https://developer.withings.com/developer-guide/v3/data-api/notifications/notification-content), [subscription](https://developer.withings.com/developer-guide/v3/data-api/notifications/notification-subscribe), [overview](https://developer.withings.com/developer-guide/v3/data-api/notifications/notification-overview/).
