@@ -14,6 +14,11 @@ struct Ledger {
     time: i64,
     fail_final: bool,
     wrong_mat: bool,
+    fail_selection_write: bool,
+    discovery_error: bool,
+    empty_inventory: bool,
+    multiple_mats: bool,
+    legacy_id: bool,
 }
 thread_local! { static LEDGER: RefCell<Ledger> = RefCell::new(Ledger::default()); }
 pub fn clock() -> Result<i64, String> {
@@ -24,9 +29,9 @@ pub mod config {
     pub fn get(k: &str) -> Option<SettingValue> {
         Some(SettingValue::Text(
             match k {
+                "device_id" if super::LEDGER.with(|l| l.borrow().legacy_id) => "offline-mat",
                 "room" => "bedroom",
                 "user_id" => "123",
-                "device_id" => "offline-mat",
                 "client_id" => "fixture-client",
                 _ => return None,
             }
@@ -59,10 +64,14 @@ pub mod storage {
         LEDGER.with(|l| l.borrow().storage.get(k).cloned())
     }
     pub fn set(k: &str, v: &str) -> Result<(), ()> {
-        LEDGER.with(|l| {
-            l.borrow_mut().storage.insert(k.into(), v.into());
-        });
-        Ok(())
+        LEDGER.with(|l| -> Result<(), ()> {
+            let mut l = l.borrow_mut();
+            if l.fail_selection_write && k == "selection" {
+                return Err(());
+            }
+            l.storage.insert(k.into(), v.into());
+            Ok(())
+        })
     }
 }
 pub mod devices {
@@ -112,6 +121,9 @@ pub mod http {
         assert!(matches!(r.method, Method::Post));
         assert_eq!(r.timeout_ms, Some(5000));
         let body = std::str::from_utf8(r.body.as_ref().unwrap()).unwrap();
+        if LEDGER.with(|l| l.borrow().discovery_error) && body == "action=getdevice" {
+            return Err(());
+        }
         LEDGER.with(|l| l.borrow_mut().requests.push(body.into()));
         let response = if body.contains("grant_type=") {
             r#"{"status":0,"body":{"userid":123,"access_token":"fixture-access","refresh_token":"fixture-refresh","expires_in":3600,"client_id":"fixture-client"}}"#.to_string()
@@ -123,16 +135,29 @@ pub mod http {
             );
             r#"{"status":0,"body":{"profiles":[{"appli":50,"callbackurl":"https://example.org/hook","comment":"Niles Withings"},{"appli":51,"callbackurl":"https://example.org/hook","comment":"Niles Withings"}]}}"#.to_string()
         } else if body == "action=getdevice" {
-            let id = LEDGER.with(|l| {
-                if l.borrow().wrong_mat {
-                    "other-mat"
-                } else {
-                    "offline-mat"
-                }
-            });
-            format!(
-                r#"{{"status":0,"body":{{"devices":[{{"deviceid":"{id}","type":"Sleep Monitor","model":"Synthetic","model_id":1}}]}}}}"#
-            )
+            if LEDGER.with(|l| l.borrow().empty_inventory) {
+                r#"{"status":0,"body":{"devices":[]}}"#.to_string()
+            } else {
+                let (id, extra) = LEDGER.with(|l| {
+                    let l = l.borrow();
+                    (
+                        if l.wrong_mat {
+                            "other-mat"
+                        } else {
+                            "offline-mat"
+                        },
+                        l.multiple_mats,
+                    )
+                });
+                format!(
+                    r#"{{"status":0,"body":{{"devices":[{{"deviceid":"{id}","type":"Sleep Monitor","model":"Synthetic","model_id":1}}{}]}}}}"#,
+                    if extra {
+                        r#",{"deviceid":"second-mat","type":"Sleep Monitor","model":"Synthetic Two","model_id":2}"#
+                    } else {
+                        ""
+                    }
+                )
+            }
         } else {
             panic!("Unexpected synthetic HTTP operation")
         };
@@ -146,6 +171,7 @@ pub mod http {
 fn reset() {
     OWNER.with(|o| *o.borrow_mut() = Owner::new());
     SINK.with(|s| *s.id.borrow_mut() = None);
+    SINK.with(|s| *s.occupancy.borrow_mut() = None);
     LEDGER.with(|l| {
         *l.borrow_mut() = Ledger {
             time: 1000,
@@ -175,6 +201,37 @@ fn connect() -> Result<String, String> {
         None,
     )
 }
+fn choose_rendered(index: usize) -> String {
+    let tree = Plugin::render(
+        "withings".into(),
+        RenderContext {
+            room: None,
+            person: None,
+        },
+    )
+    .unwrap();
+    let (control, device) = tree
+        .nodes
+        .iter()
+        .find_map(|node| match &node.kind {
+            crate::niles::integration::ui::NodeKind::Choice(c) => {
+                Some((c.id.clone(), c.options[index].value.clone()))
+            }
+            _ => None,
+        })
+        .unwrap();
+    Plugin::on_action(
+        "withings".into(),
+        control,
+        ActionValue::Chosen(device.clone()),
+        RenderContext {
+            room: None,
+            person: None,
+        },
+    )
+    .unwrap();
+    device
+}
 #[test]
 fn actual_init_without_credentials_keeps_connect_and_blocks_events() {
     reset();
@@ -193,6 +250,7 @@ fn actual_callback_webhook_restart_and_denial() {
     reset();
     Plugin::init().unwrap();
     connect().unwrap();
+    choose_rendered(0);
     assert_eq!(Plugin::on_webhook(event(50)).status, 200);
     LEDGER.with(|l| {
         let l = l.borrow();
@@ -249,11 +307,228 @@ fn timer_rotation_final_save_failure_revokes_and_restart_refuses() {
     assert_eq!(Plugin::on_webhook(event(50)).status, 503);
 }
 #[test]
-fn absent_configured_mat_is_not_success() {
+fn interactive_choice_uses_actual_rendered_control_and_persists_then_delivers() {
     reset();
     Plugin::init().unwrap();
-    LEDGER.with(|l| l.borrow_mut().wrong_mat = true);
-    assert!(connect().is_err());
+    connect().unwrap();
+    let tree = Plugin::render(
+        "withings".into(),
+        RenderContext {
+            room: None,
+            person: None,
+        },
+    )
+    .unwrap();
+    let (control, candidate) = tree
+        .nodes
+        .iter()
+        .find_map(|node| match &node.kind {
+            crate::niles::integration::ui::NodeKind::Choice(c) => {
+                Some((c.id.clone(), c.options[0].value.clone()))
+            }
+            _ => None,
+        })
+        .expect("render includes candidate selection");
+    assert!(
+        Plugin::on_action(
+            "withings".into(),
+            control,
+            ActionValue::Chosen(candidate),
+            RenderContext {
+                room: None,
+                person: None
+            }
+        )
+        .unwrap()
+        .rerender
+    );
+    assert_eq!(Plugin::on_webhook(event(50)).status, 200);
+    Plugin::stop();
+    Plugin::init().unwrap();
+    assert_eq!(Plugin::on_webhook(event(50)).status, 200);
+}
+#[test]
+fn stale_rendered_choice_and_failed_storage_never_activate() {
+    reset();
+    Plugin::init().unwrap();
+    connect().unwrap();
+    let tree = Plugin::render(
+        "withings".into(),
+        RenderContext {
+            room: None,
+            person: None,
+        },
+    )
+    .unwrap();
+    let (control, candidate) = tree
+        .nodes
+        .iter()
+        .find_map(|node| match &node.kind {
+            crate::niles::integration::ui::NodeKind::Choice(c) => {
+                Some((c.id.clone(), c.options[0].value.clone()))
+            }
+            _ => None,
+        })
+        .unwrap();
+    let generation = control.rsplit(':').next().unwrap();
+    Plugin::on_action(
+        "withings".into(),
+        format!("switch:{generation}"),
+        ActionValue::Pressed,
+        RenderContext {
+            room: None,
+            person: None,
+        },
+    )
+    .unwrap();
+    assert!(
+        Plugin::on_action(
+            "withings".into(),
+            control.clone(),
+            ActionValue::Chosen(candidate.clone()),
+            RenderContext {
+                room: None,
+                person: None
+            }
+        )
+        .is_err()
+    );
+    assert_eq!(Plugin::on_webhook(event(50)).status, 503);
+    LEDGER.with(|l| l.borrow_mut().fail_selection_write = true);
+    let tree = Plugin::render(
+        "withings".into(),
+        RenderContext {
+            room: None,
+            person: None,
+        },
+    )
+    .unwrap();
+    let (control, candidate) = tree
+        .nodes
+        .iter()
+        .find_map(|node| match &node.kind {
+            crate::niles::integration::ui::NodeKind::Choice(c) => {
+                Some((c.id.clone(), c.options[0].value.clone()))
+            }
+            _ => None,
+        })
+        .unwrap();
+    assert!(
+        Plugin::on_action(
+            "withings".into(),
+            control,
+            ActionValue::Chosen(candidate),
+            RenderContext {
+                room: None,
+                person: None
+            }
+        )
+        .is_err()
+    );
+    assert_eq!(Plugin::on_webhook(event(50)).status, 503);
+}
+#[test]
+fn retry_distinguishes_empty_and_failed_discovery() {
+    reset();
+    Plugin::init().unwrap();
+    LEDGER.with(|l| l.borrow_mut().empty_inventory = true);
+    connect().unwrap();
+    let tree = Plugin::render(
+        "withings".into(),
+        RenderContext {
+            room: None,
+            person: None,
+        },
+    )
+    .unwrap();
+    assert!(tree.nodes.iter().any(|n| matches!(&n.kind, crate::niles::integration::ui::NodeKind::Text(t) if t.value.contains("No supported"))));
+    let retry = tree
+        .nodes
+        .iter()
+        .find_map(|n| match &n.kind {
+            crate::niles::integration::ui::NodeKind::Button(b) if b.id.starts_with("retry:") => {
+                Some(b.id.clone())
+            }
+            _ => None,
+        })
+        .unwrap();
+    LEDGER.with(|l| {
+        let mut l = l.borrow_mut();
+        l.empty_inventory = false;
+        l.discovery_error = true;
+    });
+    Plugin::on_action(
+        "withings".into(),
+        retry,
+        ActionValue::Pressed,
+        RenderContext {
+            room: None,
+            person: None,
+        },
+    )
+    .unwrap_err();
+    assert!(panel().contains("discovery is unavailable"));
+    assert_eq!(Plugin::on_webhook(event(50)).status, 503);
+}
+#[test]
+fn multiple_candidates_are_rendered_and_selected_explicitly() {
+    reset();
+    Plugin::init().unwrap();
+    LEDGER.with(|l| l.borrow_mut().multiple_mats = true);
+    connect().unwrap();
+    let tree = Plugin::render(
+        "withings".into(),
+        RenderContext {
+            room: None,
+            person: None,
+        },
+    )
+    .unwrap();
+    let choice = tree
+        .nodes
+        .iter()
+        .find_map(|n| match &n.kind {
+            crate::niles::integration::ui::NodeKind::Choice(c) => Some(c),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(choice.options.len(), 2);
+    let selected = choose_rendered(1);
+    let mut bed_in = event(50);
+    bed_in.body = String::from_utf8(bed_in.body)
+        .unwrap()
+        .replace("offline-mat", &selected)
+        .into_bytes();
+    assert_eq!(Plugin::on_webhook(bed_in.clone()).status, 200);
+    assert_eq!(Plugin::on_webhook(bed_in).status, 200);
+    LEDGER.with(|l| assert_eq!(l.borrow().actions.len(), 1));
+    LEDGER.with(|l| l.borrow_mut().time += 1);
+    let mut bed_out = event(51);
+    bed_out.body = String::from_utf8(bed_out.body)
+        .unwrap()
+        .replace("offline-mat", &selected)
+        .into_bytes();
+    assert_eq!(Plugin::on_webhook(bed_out).status, 200);
+    LEDGER.with(|l| {
+        assert_eq!(
+            l.borrow().actions,
+            [
+                ("bedroom/withings_sleep".into(), "bed_in".into()),
+                ("bedroom/withings_sleep".into(), "bed_out".into()),
+            ]
+        )
+    });
+}
+#[test]
+fn legacy_configured_mat_activates_once_and_callback_is_truthful() {
+    reset();
+    LEDGER.with(|l| l.borrow_mut().legacy_id = true);
+    Plugin::init().unwrap();
+    assert!(connect().unwrap().contains("sleep mat activated"));
+    assert_eq!(Plugin::on_webhook(event(50)).status, 200);
+    reset();
+    Plugin::init().unwrap();
+    assert!(connect().unwrap().contains("select a mat"));
     assert_eq!(Plugin::on_webhook(event(50)).status, 503);
 }
 fn panel() -> String {
@@ -282,6 +557,7 @@ fn panel_tracks_fresh_events_and_recovery_without_exposing_identifiers() {
     assert!(panel().contains("Reconnect Withings"));
     assert!(panel().contains("Occupancy unknown"));
     connect().unwrap();
+    choose_rendered(0);
     assert!(panel().contains("subscriptions ready"));
     assert!(!panel().contains("offline-mat"));
     assert_eq!(Plugin::on_webhook(event(50)).status, 200);

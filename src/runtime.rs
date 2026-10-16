@@ -114,6 +114,11 @@ impl<B: ScopedBackend, H: Sink> Owner<B, H> {
     pub fn switch_mat(&mut self) {
         self.coordinator.switch_device();
     }
+    /// Record a failed interactive discovery attempt and revoke the active
+    /// selection without modifying its durable selection or presence history.
+    pub fn discovery_failed(&mut self) {
+        self.coordinator.discovery_failed();
+    }
     /// Pause this in-memory owner. No provider unsubscribe or stored-secret
     /// deletion is performed; callers may restore validated credentials later.
     pub fn pause(&mut self) {

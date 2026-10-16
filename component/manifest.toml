@@ -23,9 +23,9 @@ required = true
 
 [[settings]]
 key = "device_id"
-label = "Sleep device ID"
+label = "Sleep device ID (optional; retained for existing setups)"
 type = "string"
-required = true
+required = false
 
 [[settings]]
 key = "room"
