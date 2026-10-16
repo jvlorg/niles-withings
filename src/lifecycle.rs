@@ -3,8 +3,8 @@
 //! Persist acquisition and expiry timestamps with tokens in one encrypted-store
 //! transaction. Refresh begins 300 seconds before expiry; timestamps are Unix
 //! seconds and must be positive. A process restart never treats unknown metadata
-//! as fresh. Storage failure after refresh is latched because rotation may have
-//! invalidated the old refresh token.
+//! as fresh. A durable pending marker precedes refresh; incomplete rotation
+//! requires authorization after restart because the old token may be invalid.
 use crate::withings_client::{
     self as client, CallbackUrl, ClientError, HttpTransport, Secret, TokenSet,
 };
@@ -53,6 +53,12 @@ impl TokenMetadata {
 /// Implement with encrypted durable storage and atomic token+metadata replacement.
 pub trait SecureTokenStore {
     type Error;
+    /// Commit a durable pending marker before any refresh request.
+    fn begin_refresh(
+        &mut self,
+        tokens: &TokenSet,
+        metadata: TokenMetadata,
+    ) -> Result<(), Self::Error>;
     fn replace_tokens_and_metadata(
         &mut self,
         tokens: &TokenSet,
@@ -266,6 +272,12 @@ impl Lifecycle {
             );
         }
         if metadata.expires_at.saturating_sub(now) <= REFRESH_LEAD {
+            if store.begin_refresh(&tokens, metadata).is_err() {
+                self.unusable = Some(BlockReason::StorageFailed);
+                return self.report(Status::RefreshPersistenceFailed, self.unusable, [false; 2]);
+            }
+            // Any ambiguous outcome remains unusable until a fresh authorization.
+            self.unusable = Some(BlockReason::RefreshFailed);
             tokens = match client::refresh_bound(
                 transport,
                 &mut AtomicStore { inner: store, now },
@@ -303,6 +315,7 @@ impl Lifecycle {
                 }
             };
             self.tokens = Some(tokens.clone());
+            self.unusable = None;
         }
         let listed = match client::list_subscriptions(transport, &tokens.access_token) {
             Ok(x) => x,
@@ -431,6 +444,9 @@ mod tests {
     }
     impl SecureTokenStore for Store {
         type Error = ();
+        fn begin_refresh(&mut self, _: &TokenSet, _: TokenMetadata) -> Result<(), ()> {
+            Ok(())
+        }
         fn replace_tokens_and_metadata(
             &mut self,
             _: &TokenSet,

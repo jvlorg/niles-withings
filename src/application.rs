@@ -24,6 +24,7 @@ pub struct SecureAccountRecord {
     refresh_token: SecretText,
     acquired_at: i64,
     expires_at: i64,
+    refresh_pending: bool,
 }
 #[derive(Clone, Serialize, Deserialize)]
 struct SecretText(String);
@@ -35,6 +36,8 @@ struct AccountRecordWire {
     refresh_token: SecretText,
     acquired_at: i64,
     expires_at: i64,
+    #[serde(default)]
+    refresh_pending: bool,
 }
 impl fmt::Debug for SecureAccountRecord {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -74,6 +77,7 @@ impl SecureAccountRecord {
             refresh_token: SecretText(tokens.refresh_token.expose_secret().to_owned()),
             acquired_at: metadata.acquired_at,
             expires_at: metadata.expires_at,
+            refresh_pending: false,
         };
         if record.serialize()?.len() > MAX_RECORD_BYTES {
             return Err(ApplicationError::InvalidRecord);
@@ -97,6 +101,7 @@ impl SecureAccountRecord {
             refresh_token: self.refresh_token.clone(),
             acquired_at: self.acquired_at,
             expires_at: self.expires_at,
+            refresh_pending: self.refresh_pending,
         })
         .map_err(|_| ApplicationError::InvalidRecord)?;
         if text.len() > MAX_RECORD_BYTES {
@@ -121,7 +126,11 @@ impl SecureAccountRecord {
             refresh_token: wire.refresh_token,
             acquired_at: wire.acquired_at,
             expires_at: wire.expires_at,
+            refresh_pending: wire.refresh_pending,
         };
+        if record.refresh_pending {
+            return Err(ApplicationError::RecoveryRequired);
+        }
         let lifetime = record
             .expires_at
             .checked_sub(record.acquired_at)
@@ -313,6 +322,18 @@ impl fmt::Debug for SetupResolution {
 }
 impl<S: AccountSecretStore> crate::lifecycle::SecureTokenStore for S {
     type Error = ApplicationError;
+    fn begin_refresh(
+        &mut self,
+        tokens: &TokenSet,
+        metadata: TokenMetadata,
+    ) -> Result<(), Self::Error> {
+        let mut record = SecureAccountRecord::from_tokens(tokens, metadata)?;
+        // Old readers reject this version rather than ignoring the pending flag.
+        record.version = 2;
+        record.refresh_pending = true;
+        self.set_account_record(&record.serialize()?)
+            .map_err(|_| ApplicationError::Storage)
+    }
     fn replace_tokens_and_metadata(
         &mut self,
         tokens: &TokenSet,
@@ -330,6 +351,7 @@ pub enum ApplicationError {
     InvalidCallback,
     AccessDenied,
     InvalidRecord,
+    RecoveryRequired,
     InvalidSelection,
     Provider,
     Storage,
@@ -742,6 +764,7 @@ mod tests {
             refresh_token: SecretText("rotated-refresh".into()),
             acquired_at: 1000,
             expires_at: 2000,
+            refresh_pending: false,
         };
         let expired_json = serde_json::to_string(&expired_restore).unwrap();
         let (tokens, metadata) = SecureAccountRecord::restore(&expired_json, 123, 2001).unwrap();
