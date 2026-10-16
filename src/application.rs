@@ -2,6 +2,7 @@
 //! The caller MUST authenticate browser state/person and webhook capability before invoking these APIs.
 use crate::{
     adapter::{Adapter, DeliveryError, Sink, Store},
+    config::Identity,
     lifecycle::TokenMetadata,
     withings_client::{self, CallbackUrl, ClientError, HttpTransport, Secret, TokenSet},
 };
@@ -161,6 +162,155 @@ pub trait AccountSecretStore {
     /// Atomically replaces the same encrypted account record written by callback.
     fn set_account_record(&mut self, serialized: &str) -> Result<(), Self::Error>;
 }
+
+/// Durable non-secret storage for the selected account/device binding. This is
+/// separate from the encrypted account record: hosts need not offer a
+/// transaction spanning their secret and ordinary stores.
+pub trait SelectionStore {
+    type Error;
+    fn load_selection(&mut self) -> Result<Option<String>, Self::Error>;
+    fn save_selection(&mut self, serialized: &str) -> Result<(), Self::Error>;
+}
+
+const SELECTION_VERSION: u8 = 1;
+const MAX_SELECTION_BYTES: usize = 512;
+
+/// A bounded, versioned account/device choice. Opaque IDs are redacted.
+#[derive(Clone, PartialEq, Eq)]
+pub struct Selection {
+    version: u8,
+    user_id: u64,
+    device_id: String,
+}
+#[derive(Serialize, Deserialize)]
+struct SelectionWire {
+    version: u8,
+    user_id: u64,
+    device_id: String,
+}
+impl fmt::Debug for Selection {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Selection")
+            .field("version", &self.version)
+            .field("user_id", &"[REDACTED]")
+            .field("device_id", &"[REDACTED]")
+            .finish()
+    }
+}
+impl Selection {
+    fn new(user_id: u64, device_id: &str) -> Result<Self, ApplicationError> {
+        if user_id == 0
+            || device_id.is_empty()
+            || device_id.len() > 128
+            || device_id.bytes().any(|b| b.is_ascii_control())
+        {
+            return Err(ApplicationError::InvalidSelection);
+        }
+        Ok(Self {
+            version: SELECTION_VERSION,
+            user_id,
+            device_id: device_id.into(),
+        })
+    }
+    pub fn serialize(&self) -> Result<String, ApplicationError> {
+        let text = serde_json::to_string(&SelectionWire {
+            version: self.version,
+            user_id: self.user_id,
+            device_id: self.device_id.clone(),
+        })
+        .map_err(|_| ApplicationError::InvalidSelection)?;
+        if text.len() > MAX_SELECTION_BYTES {
+            return Err(ApplicationError::InvalidSelection);
+        }
+        Ok(text)
+    }
+    pub fn restore(serialized: &str) -> Result<Self, ApplicationError> {
+        if serialized.len() > MAX_SELECTION_BYTES {
+            return Err(ApplicationError::InvalidSelection);
+        }
+        let wire: SelectionWire =
+            serde_json::from_str(serialized).map_err(|_| ApplicationError::InvalidSelection)?;
+        let selection = Self::new(wire.user_id, &wire.device_id)?;
+        if wire.version != SELECTION_VERSION {
+            return Err(ApplicationError::InvalidSelection);
+        }
+        Ok(selection)
+    }
+    pub fn binding_for(&self, account: u64) -> Result<Binding, ApplicationError> {
+        if self.user_id != account {
+            return Err(ApplicationError::InvalidSelection);
+        }
+        Binding::new(self.user_id, &self.device_id)
+    }
+}
+
+/// The only setup output used to construct an event adapter.
+#[derive(Clone, PartialEq, Eq)]
+pub struct Binding(Identity);
+impl Binding {
+    fn new(user_id: u64, device_id: &str) -> Result<Self, ApplicationError> {
+        Ok(Self(
+            Identity::new(user_id.to_string(), device_id)
+                .map_err(|_| ApplicationError::InvalidSelection)?,
+        ))
+    }
+    pub fn identity(&self) -> Identity {
+        self.0.clone()
+    }
+}
+impl fmt::Debug for Binding {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("Binding([REDACTED])")
+    }
+}
+
+/// Sanitized host-neutral setup presentation; it contains no token or opaque ID.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SetupPresentation {
+    AccountRequired,
+    NoEligibleDevice,
+    CandidateAvailable,
+    ChooseDevice { candidates: usize },
+    Selected,
+    StaleSelection,
+}
+pub enum SetupResolution {
+    Unavailable,
+    Candidate {
+        account: u64,
+        device: withings_client::Device,
+    },
+    Choose {
+        account: u64,
+        devices: Vec<withings_client::Device>,
+    },
+    Selected(Binding),
+    StaleSelection,
+}
+impl SetupResolution {
+    pub fn presentation(&self) -> SetupPresentation {
+        match self {
+            Self::Unavailable => SetupPresentation::NoEligibleDevice,
+            Self::Candidate { .. } => SetupPresentation::CandidateAvailable,
+            Self::Choose { devices, .. } => SetupPresentation::ChooseDevice {
+                candidates: devices.len(),
+            },
+            Self::Selected(_) => SetupPresentation::Selected,
+            Self::StaleSelection => SetupPresentation::StaleSelection,
+        }
+    }
+}
+impl fmt::Debug for SetupResolution {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Unavailable => "SetupResolution::Unavailable",
+            Self::Candidate { .. } => "SetupResolution::Candidate([REDACTED])",
+            Self::Choose { .. } => "SetupResolution::Choose([REDACTED])",
+            Self::Selected(_) => "SetupResolution::Selected([REDACTED])",
+            Self::StaleSelection => "SetupResolution::StaleSelection",
+        })
+    }
+}
 impl<S: AccountSecretStore> crate::lifecycle::SecureTokenStore for S {
     type Error = ApplicationError;
     fn replace_tokens_and_metadata(
@@ -180,6 +330,7 @@ pub enum ApplicationError {
     InvalidCallback,
     AccessDenied,
     InvalidRecord,
+    InvalidSelection,
     Provider,
     Storage,
     InvalidWebhook,
@@ -276,6 +427,84 @@ pub fn discover_account_devices<T: HttpTransport>(
         selected_id,
     ))
 }
+
+/// Load the durable choice and discover the current account's mats. A choice
+/// from another OAuth account is unconfigured; a missing or conflicting chosen
+/// device remains stale and never auto-switches.
+pub fn setup_discover<T: HttpTransport, P: SelectionStore>(
+    transport: &mut T,
+    selections: &mut P,
+    record: &SecureAccountRecord,
+    authenticated_user: u64,
+    now: i64,
+) -> Result<SetupResolution, ApplicationError> {
+    if record.user_id() != authenticated_user || authenticated_user == 0 {
+        return Err(ApplicationError::InvalidRecord);
+    }
+    let saved = selections
+        .load_selection()
+        .map_err(|_| ApplicationError::Storage)?
+        .map(|value| Selection::restore(&value))
+        .transpose()?;
+    let selected_id = saved.as_ref().and_then(|selection| {
+        (selection.user_id == authenticated_user).then_some(selection.device_id.as_str())
+    });
+    match discover_account_devices(transport, record, authenticated_user, selected_id, now)? {
+        withings_client::DeviceSelection::Unavailable => Ok(SetupResolution::Unavailable),
+        withings_client::DeviceSelection::Candidate(device) => Ok(SetupResolution::Candidate {
+            account: authenticated_user,
+            device,
+        }),
+        withings_client::DeviceSelection::Choose(devices) => Ok(SetupResolution::Choose {
+            account: authenticated_user,
+            devices,
+        }),
+        withings_client::DeviceSelection::Selected(device) => Ok(SetupResolution::Selected(
+            Selection::new(authenticated_user, &device.device_id)?
+                .binding_for(authenticated_user)?,
+        )),
+        withings_client::DeviceSelection::StaleSelection => Ok(SetupResolution::StaleSelection),
+        withings_client::DeviceSelection::AccountMismatch => Err(ApplicationError::InvalidRecord),
+    }
+}
+
+/// Explicitly accept a discovered candidate. Save completes before a binding
+/// is returned, so save failure cannot activate webhook processing.
+pub fn accept_selection<P: SelectionStore>(
+    selections: &mut P,
+    authenticated_user: u64,
+    discovered: &SetupResolution,
+    device_id: &str,
+) -> Result<Binding, ApplicationError> {
+    let matches = match discovered {
+        SetupResolution::Candidate { account, device } => {
+            *account == authenticated_user && device.device_id == device_id
+        }
+        SetupResolution::Choose { account, devices } => {
+            *account == authenticated_user
+                && devices.iter().any(|device| device.device_id == device_id)
+        }
+        _ => false,
+    };
+    if !matches {
+        return Err(ApplicationError::InvalidSelection);
+    }
+    let selection = Selection::new(authenticated_user, device_id)?;
+    selections
+        .save_selection(&selection.serialize()?)
+        .map_err(|_| ApplicationError::Storage)?;
+    selection.binding_for(authenticated_user)
+}
+
+/// Construct the existing event adapter only from a durable setup binding.
+pub fn adapter_from_binding<S: Store, H: Sink>(
+    binding: &Binding,
+    store: S,
+    sink: H,
+) -> Result<Adapter<S, H>, DeliveryError> {
+    Adapter::new(binding.identity(), store, sink)
+}
+
 fn map_client(_: ClientError) -> ApplicationError {
     ApplicationError::Provider
 }
@@ -587,8 +816,36 @@ mod tests {
         );
         assert!(transport.0.is_empty());
         let shared = Shared::default();
-        let id = Identity::new(user_id.to_string(), "mat").unwrap();
-        let mut adapter = Adapter::new(id.clone(), shared.clone(), shared.clone()).unwrap();
+        #[derive(Default)]
+        struct SelectionMemory(Option<String>);
+        impl SelectionStore for SelectionMemory {
+            type Error = ();
+            fn load_selection(&mut self) -> Result<Option<String>, ()> {
+                Ok(self.0.clone())
+            }
+            fn save_selection(&mut self, value: &str) -> Result<(), ()> {
+                self.0 = Some(value.into());
+                Ok(())
+            }
+        }
+        let (tokens, metadata) =
+            SecureAccountRecord::restore(secrets.value.as_deref().unwrap(), user_id, 1001).unwrap();
+        let record = SecureAccountRecord::from_tokens(&tokens, metadata).unwrap();
+        let mut selections = SelectionMemory::default();
+        let inventory = || {
+            HttpResponse { status: 200, body: br#"{"status":0,"body":{"devices":[{"deviceid":"mat","type":"Sleep Monitor","model":"Aura Sensor","model_id":61}]}}"#.to_vec() }
+        };
+        transport.0.push_back(inventory());
+        let candidate =
+            setup_discover(&mut transport, &mut selections, &record, user_id, 1001).unwrap();
+        let binding = accept_selection(&mut selections, user_id, &candidate, "mat").unwrap();
+        let id = binding.identity();
+        let mut adapter = adapter_from_binding(&binding, shared.clone(), shared.clone()).unwrap();
+        transport.0.push_back(inventory());
+        assert!(matches!(
+            setup_discover(&mut transport, &mut selections, &record, user_id, 1001).unwrap(),
+            SetupResolution::Selected(_)
+        ));
         let event = |appli, date| WebhookRequest {
             method: "POST".into(),
             content_type: "application/x-www-form-urlencoded".into(),
