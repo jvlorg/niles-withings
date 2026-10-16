@@ -79,6 +79,15 @@ impl SecureAccountRecord {
         }
         Ok(record)
     }
+    pub fn user_id(&self) -> u64 {
+        self.user_id
+    }
+    pub fn access_token(&self) -> Result<Secret, ApplicationError> {
+        let serialized = self.serialize()?;
+        let wire: AccountRecordWire =
+            serde_json::from_str(&serialized).map_err(|_| ApplicationError::InvalidRecord)?;
+        Secret::new(wire.access_token.0).map_err(|_| ApplicationError::InvalidRecord)
+    }
     pub fn serialize(&self) -> Result<String, ApplicationError> {
         let text = serde_json::to_string(&AccountRecordWire {
             version: self.version,
@@ -245,6 +254,28 @@ pub fn on_callback<T: HttpTransport, S: AccountSecretStore>(
         user_id: tokens.user_id,
     })
 }
+pub fn discover_account_devices<T: HttpTransport>(
+    transport: &mut T,
+    record: &SecureAccountRecord,
+    authenticated_user: u64,
+    selected_id: Option<&str>,
+    now: i64,
+) -> Result<withings_client::DeviceSelection, ApplicationError> {
+    if record.user_id() != authenticated_user || authenticated_user == 0 {
+        return Ok(withings_client::DeviceSelection::AccountMismatch);
+    }
+    if now < record.acquired_at || now >= record.expires_at {
+        return Err(ApplicationError::InvalidRecord);
+    }
+    let devices =
+        withings_client::list_devices(transport, &record.access_token()?).map_err(map_client)?;
+    Ok(withings_client::select_sleep_device(
+        record.user_id(),
+        authenticated_user,
+        &devices,
+        selected_id,
+    ))
+}
 fn map_client(_: ClientError) -> ApplicationError {
     ApplicationError::Provider
 }
@@ -368,18 +399,25 @@ mod tests {
     struct Data {
         state: Option<String>,
         actions: Vec<&'static str>,
-        fail: bool,
+        fail_load: bool,
+        fail_save: bool,
+        fail_reading: bool,
+        fail_action: bool,
     }
     #[derive(Clone, Default)]
     struct Shared(Rc<RefCell<Data>>);
     impl Store for Shared {
         type Error = &'static str;
         fn load(&mut self) -> Result<Option<String>, &'static str> {
-            Ok(self.0.borrow().state.clone())
+            if self.0.borrow().fail_load {
+                Err("load failed")
+            } else {
+                Ok(self.0.borrow().state.clone())
+            }
         }
         fn save(&mut self, s: &str) -> Result<(), &'static str> {
             let mut d = self.0.borrow_mut();
-            if d.fail {
+            if d.fail_save {
                 return Err("failed");
             }
             d.state = Some(s.to_owned());
@@ -389,15 +427,20 @@ mod tests {
     impl Sink for Shared {
         type Error = &'static str;
         fn publish_reading(&mut self, _: crate::adapter::Reading) -> Result<(), &'static str> {
-            if self.0.borrow().fail {
+            if self.0.borrow().fail_reading {
                 Err("failed")
             } else {
                 Ok(())
             }
         }
         fn publish_action(&mut self, a: &'static str) -> Result<(), &'static str> {
-            self.0.borrow_mut().actions.push(a);
-            Ok(())
+            let mut d = self.0.borrow_mut();
+            if d.fail_action {
+                Err("action failed")
+            } else {
+                d.actions.push(a);
+                Ok(())
+            }
         }
     }
     fn response() -> HttpResponse {
@@ -624,6 +667,72 @@ mod tests {
         assert_eq!(s.value.as_deref(), Some("previous-record"));
     }
     #[test]
+    fn webhook_failure_sites_are_separately_injected_and_retry_is_lossy() {
+        let request = WebhookRequest {
+            method: "POST".into(),
+            content_type: "application/x-www-form-urlencoded".into(),
+            body: b"userid=12345&deviceid=mat&appli=50&date=1000".to_vec(),
+        };
+        let shared = Shared::default();
+        shared.0.borrow_mut().fail_load = true;
+        assert!(
+            Adapter::new(
+                Identity::new("12345", "mat").unwrap(),
+                shared.clone(),
+                shared.clone()
+            )
+            .is_err()
+        );
+        let shared = Shared::default();
+        shared.0.borrow_mut().fail_save = true;
+        let mut adapter = Adapter::new(
+            Identity::new("12345", "mat").unwrap(),
+            shared.clone(),
+            shared.clone(),
+        )
+        .unwrap();
+        assert_eq!(on_webhook(&mut adapter, &request, 1000, 0, 0).status, 503);
+        shared.0.borrow_mut().fail_save = false;
+        assert_eq!(on_webhook(&mut adapter, &request, 1000, 0, 0).status, 200);
+        let shared = Shared::default();
+        shared.0.borrow_mut().fail_reading = true;
+        let mut adapter = Adapter::new(
+            Identity::new("12345", "mat").unwrap(),
+            shared.clone(),
+            shared.clone(),
+        )
+        .unwrap();
+        assert_eq!(on_webhook(&mut adapter, &request, 1000, 0, 0).status, 503);
+        shared.0.borrow_mut().fail_reading = false;
+        assert_eq!(on_webhook(&mut adapter, &request, 1000, 0, 0).status, 200);
+        let shared = Shared::default();
+        shared.0.borrow_mut().fail_action = true;
+        let mut adapter = Adapter::new(
+            Identity::new("12345", "mat").unwrap(),
+            shared.clone(),
+            shared.clone(),
+        )
+        .unwrap();
+        let transition = WebhookRequest {
+            body: b"userid=12345&deviceid=mat&appli=50&date=1000".to_vec(),
+            ..request
+        };
+        assert_eq!(
+            on_webhook(&mut adapter, &transition, 1000, 0, 0).status,
+            503
+        );
+        shared.0.borrow_mut().fail_action = false;
+        assert_eq!(
+            on_webhook(&mut adapter, &transition, 1000, 0, 0).status,
+            200
+        );
+        assert!(
+            shared.0.borrow().actions.is_empty(),
+            "committed retry is intentionally not replayed"
+        );
+    }
+
+    #[test]
     fn webhook_methods_validation_dedup_restart_and_failures() {
         let shared = Shared::default();
         let identity = Identity::new("12345", "mat").unwrap();
@@ -709,7 +818,7 @@ mod tests {
             .status,
             413
         );
-        shared.0.borrow_mut().fail = true;
+        shared.0.borrow_mut().fail_save = true;
         assert_eq!(
             on_webhook(
                 &mut restarted,

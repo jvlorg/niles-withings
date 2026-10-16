@@ -7,6 +7,7 @@ use url::Url;
 const AUTH_URL: &str = "https://account.withings.com/oauth2_user/authorize2";
 const TOKEN_URL: &str = "https://wbsapi.withings.net/v2/oauth2";
 const NOTIFY_URL: &str = "https://wbsapi.withings.net/notify";
+const USER_URL: &str = "https://wbsapi.withings.net/v2/user";
 pub const BED_SCOPE: &str = "user.sleepevents";
 pub const BED_APPLI: u8 = 50;
 pub const BED_APPLI_OUT: u8 = 51;
@@ -311,6 +312,125 @@ pub fn refresh_bound<T: HttpTransport, S: SecretStore>(
         Err(ClientError::AccountMismatch)
     } else {
         result
+    }
+}
+
+/// A linked provider device. The opaque ID is redacted from diagnostics.
+#[derive(Clone, PartialEq, Eq)]
+pub struct Device {
+    pub device_id: String,
+    pub device_type: String,
+    pub model: String,
+    pub model_id: u64,
+}
+impl fmt::Debug for Device {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Device")
+            .field("device_id", &"[REDACTED]")
+            .field("device_type", &self.device_type)
+            .field("model", &self.model)
+            .field("model_id", &self.model_id)
+            .finish()
+    }
+}
+
+#[derive(Deserialize)]
+struct DevicesBody {
+    devices: Vec<DeviceWire>,
+}
+#[derive(Deserialize)]
+struct DeviceWire {
+    deviceid: String,
+    #[serde(rename = "type")]
+    device_type: String,
+    model: String,
+    model_id: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DeviceSelection {
+    Unavailable,
+    Candidate(Device),
+    Choose(Vec<Device>),
+    Selected(Device),
+    StaleSelection,
+    AccountMismatch,
+}
+
+/// Uses the documented `user.getdevice` action and bearer authorization.
+pub fn list_devices<T: HttpTransport>(
+    t: &mut T,
+    token: &Secret,
+) -> Result<Vec<Device>, ClientError> {
+    let body: DevicesBody = checked_json(
+        t.post(HttpRequest {
+            url: USER_URL,
+            form: form(&[("action", "getdevice")]),
+            bearer: Some(token.clone()),
+        })
+        .map_err(|_| ClientError::Transport)?,
+    )?;
+    if body.devices.len() > 256 {
+        return Err(ClientError::MalformedResponse);
+    }
+    body.devices
+        .into_iter()
+        .map(|row| {
+            if row.deviceid.is_empty()
+                || row.deviceid.len() > 128
+                || row.deviceid.bytes().any(|b| b.is_ascii_control())
+                || row.device_type.is_empty()
+                || row.device_type.len() > 128
+                || row.model.is_empty()
+                || row.model.len() > 128
+                || row.model_id == 0
+            {
+                return Err(ClientError::MalformedResponse);
+            }
+            Ok(Device {
+                device_id: row.deviceid,
+                device_type: row.device_type,
+                model: row.model,
+                model_id: row.model_id,
+            })
+        })
+        .collect()
+}
+
+/// Pure resolution preserves explicit selections and never auto-switches.
+pub fn select_sleep_device(
+    expected_user: u64,
+    authenticated_user: u64,
+    discovered: &[Device],
+    selected_id: Option<&str>,
+) -> DeviceSelection {
+    if expected_user == 0 || authenticated_user != expected_user {
+        return DeviceSelection::AccountMismatch;
+    }
+    let mut by_id = std::collections::BTreeMap::<&str, &Device>::new();
+    let mut conflicting = std::collections::BTreeSet::new();
+    for device in discovered {
+        if let Some(prior) = by_id.insert(&device.device_id, device)
+            && prior != device
+        {
+            conflicting.insert(device.device_id.as_str());
+        }
+    }
+    let eligible: Vec<Device> = by_id
+        .into_values()
+        .filter(|d| d.device_type == "Sleep Monitor" && !conflicting.contains(d.device_id.as_str()))
+        .cloned()
+        .collect();
+    if let Some(id) = selected_id {
+        return eligible
+            .into_iter()
+            .find(|d| d.device_id == id)
+            .map_or(DeviceSelection::StaleSelection, DeviceSelection::Selected);
+    }
+    match eligible.len() {
+        0 => DeviceSelection::Unavailable,
+        1 => DeviceSelection::Candidate(eligible.into_iter().next().expect("one device")),
+        _ => DeviceSelection::Choose(eligible),
     }
 }
 
@@ -727,6 +847,111 @@ mod tests {
         );
         assert!(t.req[0].form.contains("appli=50"));
         assert!(t.req[1].form.contains("appli=51"));
+    }
+    #[test]
+    fn documented_getdevice_and_bounded_account_selection() {
+        let fixture = |rows: &str| format!(r#"{{"status":0,"body":{{"devices":[{rows}]}}}}"#);
+        let mat = r#"{"deviceid":"synthetic-sleep-id","type":"Sleep Monitor","model":"Aura Sensor","model_id":61}"#;
+        let scale =
+            r#"{"deviceid":"synthetic-scale-id","type":"Scale","model":"Body+","model_id":5}"#;
+        let other = r#"{"deviceid":"synthetic-unknown-id","type":"Uncatalogued","model":"Unknown","model_id":999}"#;
+        let mut t = Mock::default();
+        t.res
+            .push_back(r(200, &fixture(&format!("{scale},{mat},{other}"))));
+        let devices = list_devices(&mut t, &Secret::new("synthetic-token").unwrap()).unwrap();
+        assert_eq!(t.req[0].url, USER_URL);
+        assert_eq!(t.req[0].form, "action=getdevice");
+        assert_eq!(devices.len(), 3);
+        assert_eq!(
+            select_sleep_device(7, 7, &[], None),
+            DeviceSelection::Unavailable
+        );
+        assert!(matches!(
+            select_sleep_device(7, 7, &devices, None),
+            DeviceSelection::Candidate(_)
+        ));
+        assert_eq!(
+            select_sleep_device(7, 8, &devices, None),
+            DeviceSelection::AccountMismatch
+        );
+        assert_eq!(
+            select_sleep_device(7, 7, &devices, Some("vanished")),
+            DeviceSelection::StaleSelection
+        );
+        assert!(!format!("{:?}", devices[1]).contains("synthetic-sleep-id"));
+        let mut conflicting = devices.clone();
+        conflicting.push(Device {
+            device_type: "Scale".into(),
+            ..devices[1].clone()
+        });
+        for rows in [conflicting.clone(), conflicting.into_iter().rev().collect()] {
+            assert_eq!(
+                select_sleep_device(7, 7, &rows, Some("synthetic-sleep-id")),
+                DeviceSelection::StaleSelection
+            );
+        }
+        let mut duplicate = devices.clone();
+        duplicate.push(devices[1].clone());
+        assert!(matches!(
+            select_sleep_device(7, 7, &duplicate, Some("synthetic-sleep-id")),
+            DeviceSelection::Selected(_)
+        ));
+        duplicate.push(Device {
+            device_id: "synthetic-second".into(),
+            device_type: "Sleep Monitor".into(),
+            model: "Aura Sensor".into(),
+            model_id: 61,
+        });
+        assert!(
+            matches!(select_sleep_device(7, 7, &duplicate, None), DeviceSelection::Choose(v) if v.len() == 2)
+        );
+    }
+    #[test]
+    fn getdevice_rejects_bad_provider_replies_and_transport_without_leaking() {
+        for (status, body, expected) in [
+            (
+                503,
+                r#"{"status":0,"body":{"devices":[]}}"#,
+                ClientError::HttpStatus,
+            ),
+            (200, "not-json", ClientError::MalformedResponse),
+            (
+                200,
+                r#"{"status":12,"body":{"devices":[]}}"#,
+                ClientError::ProviderStatus,
+            ),
+            (
+                200,
+                r#"{"status":0,"body":{}}"#,
+                ClientError::MalformedResponse,
+            ),
+            (
+                200,
+                r#"{"status":0,"body":{"devices":[{"deviceid":"x","type":"Sleep Monitor","model":"Aura","model_id":0}]}}"#,
+                ClientError::MalformedResponse,
+            ),
+        ] {
+            let mut t = Mock::default();
+            t.res.push_back(r(status, body));
+            assert_eq!(
+                list_devices(&mut t, &Secret::new("synthetic-token").unwrap()),
+                Err(expected)
+            );
+        }
+        let mut t = Mock::default();
+        assert_eq!(
+            list_devices(&mut t, &Secret::new("synthetic-token").unwrap()),
+            Err(ClientError::Transport)
+        );
+        let mut t = Mock::default();
+        t.res.push_back(HttpResponse {
+            status: 200,
+            body: vec![b' '; MAX_RESPONSE + 1],
+        });
+        assert_eq!(
+            list_devices(&mut t, &Secret::new("synthetic-token").unwrap()),
+            Err(ClientError::MalformedResponse)
+        );
     }
     #[test]
     fn subscribe_both_and_partial_failure_is_error() {
