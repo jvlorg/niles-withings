@@ -2,15 +2,18 @@ id = "withings"
 name = "Withings"
 version = "0.1.0"
 authors = ["Johan Volmers Leth"]
-description = "Withings Sleep bed-presence status; callback support is not yet available."
+description = "Withings Sleep bed-presence status and account callbacks."
 keywords = ["withings", "bed", "sleep", "presence"]
-min_niles = "0.2.1"
-interface = "0.2"
+min_niles = "0.3.0"
+interface = "0.3"
 
 [permissions]
 devices = true
 tools = true
 ui = true
+callback = true
+webhook = true
+http = ["account.withings.com", "wbsapi.withings.net"]
 
 [[settings]]
 key = "user_id"
@@ -28,6 +31,18 @@ required = true
 key = "room"
 label = "Bed room"
 type = "room"
+required = true
+
+[[settings]]
+key = "client_id"
+label = "Withings Client ID"
+type = "string"
+required = true
+
+[[settings]]
+key = "client_secret"
+label = "Withings Client Secret"
+type = "secret"
 required = true
 
 [[ui.menu]]
