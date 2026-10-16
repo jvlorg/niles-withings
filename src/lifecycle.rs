@@ -202,6 +202,9 @@ impl Lifecycle {
             subscriptions: self.last_verified.map_or([false; 2], |x| x.0),
         }
     }
+    pub fn credentials(&self) -> Option<(TokenSet, TokenMetadata)> {
+        Some((self.tokens.clone()?, self.metadata?))
+    }
     #[allow(clippy::too_many_arguments)]
     pub fn reconcile<T: HttpTransport, S: SecureTokenStore>(
         &mut self,

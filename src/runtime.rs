@@ -1,0 +1,167 @@
+//! Compact host-neutral owner for credentials, subscription lifecycle and event delivery.
+use crate::{
+    adapter::Sink,
+    application::{
+        self, AccountSecretStore, CallbackResult, SelectionStore, WebhookRequest, WebhookResponse,
+    },
+    coordinator::{Coordinator, ScopedBackend, ScopedStore, SetupView},
+    lifecycle::{self, Clock, Lifecycle, LifecycleStatus, SecureTokenStore},
+    withings_client::{CallbackUrl, HttpTransport, Secret},
+};
+
+pub trait AccountRecordRead: AccountSecretStore {
+    fn read_account_record(&mut self) -> Result<Option<String>, Self::Error>;
+}
+
+// Coordinator's backend type is host-specific, so the runtime retains it as a generic.
+pub struct Owner<B: ScopedBackend, H: Sink> {
+    lifecycle: Lifecycle,
+    coordinator: Coordinator<ScopedStore<B>, H>,
+    record: Option<application::SecureAccountRecord>,
+}
+
+impl<B: ScopedBackend, H: Sink> Owner<B, H> {
+    #[allow(clippy::new_without_default)]
+    pub fn new() -> Self {
+        Self {
+            lifecycle: Lifecycle::new(0, None, None),
+            coordinator: Coordinator::default(),
+            record: None,
+        }
+    }
+
+    pub fn restore<R: AccountRecordRead>(
+        &mut self,
+        store: &mut R,
+        account: u64,
+        now: i64,
+    ) -> Result<(), application::ApplicationError> {
+        self.record = None;
+        self.lifecycle = Lifecycle::new(0, None, None);
+        // Deliberately revoke before reading; missing bytes are expected here.
+        let _ = self.coordinator.restore_account(None, account, now);
+        let raw = store
+            .read_account_record()
+            .map_err(|_| application::ApplicationError::Storage)?;
+        let raw = raw.ok_or(application::ApplicationError::InvalidRecord)?;
+        let (tokens, metadata) = self.coordinator.restore_account(Some(&raw), account, now)?;
+        self.record = Some(application::SecureAccountRecord::from_tokens(
+            &tokens, metadata,
+        )?);
+        self.lifecycle = Lifecycle::new(account, Some(tokens), Some(metadata));
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn callback<T: HttpTransport, R: AccountRecordRead>(
+        &mut self,
+        transport: &mut T,
+        store: &mut R,
+        callback: &CallbackUrl,
+        query: &[(String, String)],
+        person: Option<&str>,
+        client_id: &str,
+        client_secret: &Secret,
+        now: i64,
+    ) -> Result<CallbackResult, application::ApplicationError> {
+        self.record = None;
+        self.lifecycle = Lifecycle::new(0, None, None);
+        self.coordinator
+            .set_lifecycle(lifecycle::Status::AuthorizationRequired);
+        let result = application::on_callback(
+            transport,
+            store,
+            callback,
+            query,
+            person,
+            client_id,
+            client_secret,
+            now,
+        )?;
+        if let CallbackResult::Stored { user_id } = result {
+            self.restore(store, user_id, now)?;
+            Ok(CallbackResult::Stored { user_id })
+        } else {
+            Ok(result)
+        }
+    }
+
+    pub fn discover<T: HttpTransport, P: SelectionStore>(
+        &mut self,
+        t: &mut T,
+        p: &mut P,
+        now: i64,
+    ) -> Result<crate::coordinator::SetupStatus, application::ApplicationError> {
+        let record = self
+            .record
+            .as_ref()
+            .ok_or(application::ApplicationError::RecoveryRequired)?;
+        self.coordinator.discover(t, p, record, now)
+    }
+    pub fn accept<P: SelectionStore>(
+        &mut self,
+        p: &mut P,
+        id: &str,
+        generation: u64,
+        backend: B,
+        sink: H,
+    ) -> Result<(), application::ApplicationError> {
+        self.coordinator
+            .accept_scoped(p, id, generation, backend, sink)
+    }
+    #[allow(clippy::too_many_arguments)]
+    pub fn reconcile<T: HttpTransport, R: SecureTokenStore, C: Clock>(
+        &mut self,
+        t: &mut T,
+        s: &mut R,
+        c: &C,
+        client_id: &str,
+        secret: &Secret,
+        callback: &CallbackUrl,
+        comment: &str,
+    ) -> LifecycleStatus {
+        let status = self
+            .lifecycle
+            .reconcile_at(t, s, c, client_id, secret, callback, comment);
+        self.coordinator.set_lifecycle(status.status);
+        if matches!(
+            status.status,
+            lifecycle::Status::Ready | lifecycle::Status::SubscriptionsIncomplete
+        ) {
+            if let Some(record) = self
+                .lifecycle
+                .credentials()
+                .and_then(|(t, m)| application::SecureAccountRecord::from_tokens(&t, m).ok())
+            {
+                self.record = Some(record);
+            }
+        } else {
+            self.record = None;
+        }
+        status
+    }
+    pub fn webhook(
+        &mut self,
+        request: &WebhookRequest,
+        now: i64,
+        max_age: i64,
+        skew: i64,
+    ) -> WebhookResponse {
+        self.coordinator.webhook(request, now, max_age, skew)
+    }
+    pub fn generation(&self) -> u64 {
+        self.coordinator.generation()
+    }
+    pub fn activate<P: SelectionStore>(
+        &mut self,
+        p: &mut P,
+        account: u64,
+        backend: B,
+        sink: H,
+    ) -> Result<(), application::ApplicationError> {
+        self.coordinator.activate_scoped(p, account, backend, sink)
+    }
+    pub fn presentation(&self) -> SetupView {
+        self.coordinator.presentation()
+    }
+}

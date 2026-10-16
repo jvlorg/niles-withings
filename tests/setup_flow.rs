@@ -614,6 +614,227 @@ fn callback_recovery_through_coordinator_to_bed_event() {
     assert_eq!(shared.0.borrow().actions, vec!["bed_in"]);
     assert_eq!(t.calls, 2);
 }
+#[test]
+fn callback_recovery_through_runtime_to_bed_event() {
+    use niles_withings::{
+        application::{AccountSecretStore, WebhookRequest},
+        withings_client::{CallbackUrl, Secret},
+    };
+    #[derive(Default)]
+    struct Secrets(String);
+    impl AccountSecretStore for Secrets {
+        type Error = ();
+        fn set_account_record(&mut self, s: &str) -> Result<(), ()> {
+            self.0 = s.into();
+            Ok(())
+        }
+    }
+    let mut c = niles_withings::runtime::Owner::<Shared, Shared>::new();
+    let mut pending: serde_json::Value =
+        serde_json::from_str(&record(123).serialize().unwrap()).unwrap();
+    pending["version"] = 2.into();
+    pending["refresh_pending"] = true.into();
+    let shared = Shared::default();
+    let mut selections = Selections::default();
+    impl niles_withings::runtime::AccountRecordRead for Secrets {
+        fn read_account_record(&mut self) -> Result<Option<String>, ()> {
+            Ok(Some(self.0.clone()))
+        }
+    }
+    let mut secrets = Secrets(pending.to_string());
+    c.restore(&mut secrets, 123, 1001).unwrap_err();
+    struct FlowTransport {
+        replies: std::collections::VecDeque<HttpResponse>,
+        calls: usize,
+    }
+    impl HttpTransport for FlowTransport {
+        type Error = ();
+        fn post(&mut self, request: HttpRequest) -> Result<HttpResponse, ()> {
+            if self.calls == 0 {
+                assert!(request.form.starts_with("action=requesttoken&"));
+            } else {
+                assert_eq!(request.form, "action=getdevice");
+            }
+            self.calls += 1;
+            self.replies.pop_front().ok_or(())
+        }
+    }
+    let mut t=FlowTransport{replies:[HttpResponse{status:200,body:br#"{"status":0,"body":{"userid":123,"access_token":"callback-access","refresh_token":"callback-refresh","expires_in":3600,"scope":"user.sleepevents","token_type":"Bearer"}}"#.to_vec()},devices(MAT)].into(),calls:0};
+    c.callback(
+        &mut t,
+        &mut secrets,
+        &CallbackUrl::parse("https://example.com/callback").unwrap(),
+        &[("code".into(), "synthetic".into())],
+        None,
+        "client",
+        &Secret::new("secret").unwrap(),
+        1001,
+    )
+    .unwrap();
+    c.discover(&mut t, &mut selections, 1001).unwrap();
+    c.accept(
+        &mut selections,
+        "synthetic-mat",
+        c.generation(),
+        shared.clone(),
+        shared.clone(),
+    )
+    .unwrap();
+    assert!(shared.0.borrow().actions.is_empty());
+    let e = WebhookRequest {
+        method: "POST".into(),
+        content_type: "application/x-www-form-urlencoded".into(),
+        body: b"userid=123&deviceid=synthetic-mat&appli=50&date=1001".to_vec(),
+    };
+    assert_eq!(c.webhook(&e, 1001, 0, 0).status, 200);
+    assert_eq!(c.webhook(&e, 1001, 0, 0).status, 200);
+    assert_eq!(shared.0.borrow().actions, vec!["bed_in"]);
+    assert_eq!(t.calls, 2);
+}
+#[test]
+fn runtime_restore_rotation_revocation_and_restart() {
+    use niles_withings::{
+        application::{AccountSecretStore, WebhookRequest},
+        lifecycle::{FixedClock, Status},
+        runtime::{AccountRecordRead, Owner},
+        withings_client::{CallbackUrl, Secret},
+    };
+    struct Secrets {
+        raw: String,
+        writes: usize,
+        fail: usize,
+        read_fail: bool,
+    }
+    impl AccountSecretStore for Secrets {
+        type Error = ();
+        fn set_account_record(&mut self, s: &str) -> Result<(), ()> {
+            self.writes += 1;
+            if self.writes == self.fail {
+                return Err(());
+            }
+            self.raw = s.into();
+            Ok(())
+        }
+    }
+    impl AccountRecordRead for Secrets {
+        fn read_account_record(&mut self) -> Result<Option<String>, ()> {
+            if self.read_fail {
+                Err(())
+            } else {
+                Ok(Some(self.raw.clone()))
+            }
+        }
+    }
+    struct Http {
+        replies: std::collections::VecDeque<HttpResponse>,
+        bearers: Vec<Option<String>>,
+    }
+    impl HttpTransport for Http {
+        type Error = ();
+        fn post(&mut self, r: HttpRequest) -> Result<HttpResponse, ()> {
+            self.bearers
+                .push(r.bearer.map(|s| s.expose_secret().to_owned()));
+            self.replies.pop_front().ok_or(())
+        }
+    }
+    let token = || {
+        HttpResponse{status:200,body:br#"{"status":0,"body":{"userid":123,"access_token":"rotated","refresh_token":"rotated-refresh","expires_in":3600,"scope":"user.sleepevents","token_type":"Bearer"}}"#.to_vec()}
+    };
+    let profiles = || {
+        HttpResponse{status:200,body:br#"{"status":0,"body":{"profiles":[{"appli":50,"callbackurl":"https://example.com/hook","comment":"owned"},{"appli":51,"callbackurl":"https://example.com/hook","comment":"owned"}]}}"#.to_vec()}
+    };
+    let mut secrets = Secrets {
+        raw: record(123).serialize().unwrap(),
+        writes: 0,
+        fail: usize::MAX,
+        read_fail: false,
+    };
+    let mut h = Http {
+        replies: [
+            devices(MAT),
+            token(),
+            profiles(),
+            profiles(),
+            profiles(),
+            profiles(),
+            devices(MAT),
+            devices(MAT),
+            token(),
+        ]
+        .into(),
+        bearers: vec![],
+    };
+    let mut o = Owner::<Shared, Shared>::new();
+    let shared = Shared::default();
+    let mut selections = Selections::default();
+    assert!(o.discover(&mut h, &mut selections, 1001).is_err());
+    assert!(h.bearers.is_empty());
+    o.restore(&mut secrets, 123, 1001).unwrap();
+    o.discover(&mut h, &mut selections, 1001).unwrap();
+    o.accept(
+        &mut selections,
+        "synthetic-mat",
+        o.generation(),
+        shared.clone(),
+        shared.clone(),
+    )
+    .unwrap();
+    let event = |appli, date| WebhookRequest {
+        method: "POST".into(),
+        content_type: "application/x-www-form-urlencoded".into(),
+        body: format!("userid=123&deviceid=synthetic-mat&appli={appli}&date={date}").into_bytes(),
+    };
+    assert_eq!(o.webhook(&event(50, 1001), 1001, 0, 0).status, 200);
+    let url = CallbackUrl::parse("https://example.com/hook").unwrap();
+    let secret = Secret::new("secret").unwrap();
+    assert_eq!(
+        o.reconcile(
+            &mut h,
+            &mut secrets,
+            &FixedClock(4500),
+            "client",
+            &secret,
+            &url,
+            "owned"
+        )
+        .status,
+        Status::Ready
+    );
+    o.discover(&mut h, &mut selections, 4500).unwrap();
+    assert_eq!(h.bearers.last().unwrap().as_deref(), Some("rotated"));
+    drop(o);
+    let mut o = Owner::<Shared, Shared>::new();
+    o.restore(&mut secrets, 123, 4500).unwrap();
+    o.discover(&mut h, &mut selections, 4500).unwrap();
+    o.activate(&mut selections, 123, shared.clone(), shared.clone())
+        .unwrap();
+    assert_eq!(o.webhook(&event(50, 1001), 4500, 10000, 0).status, 200);
+    assert_eq!(shared.0.borrow().actions, vec!["bed_in"]);
+    assert_eq!(o.webhook(&event(51, 4501), 4501, 0, 0).status, 200);
+    secrets.fail = secrets.writes + 2;
+    assert_eq!(
+        o.reconcile(
+            &mut h,
+            &mut secrets,
+            &FixedClock(8000),
+            "client",
+            &secret,
+            &url,
+            "owned"
+        )
+        .status,
+        Status::RefreshPersistenceFailed
+    );
+    assert_eq!(o.webhook(&event(50, 8000), 8000, 0, 0).status, 503);
+    assert!(o.restore(&mut secrets, 123, 8000).is_err());
+    let calls = h.bearers.len();
+    assert!(o.discover(&mut h, &mut selections, 8000).is_err());
+    assert_eq!(h.bearers.len(), calls);
+    secrets.read_fail = true;
+    assert!(o.restore(&mut secrets, 123, 8000).is_err());
+    assert_eq!(o.webhook(&event(50, 8000), 8000, 0, 0).status, 503);
+    assert_eq!(shared.0.borrow().actions, vec!["bed_in", "bed_out"]);
+}
 const MAT: &str =
     r#"{"deviceid":"synthetic-mat","type":"Sleep Monitor","model":"Aura Sensor","model_id":61}"#;
 
