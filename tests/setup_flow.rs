@@ -268,22 +268,20 @@ fn coordinator_presentation_follows_owned_setup_states_and_redacts_actions() {
     let mut owner =
         Coordinator::<niles_withings::coordinator::ScopedStore<StateStore>, Events>::default();
     assert_eq!(
-        owner.presentation(false).connection,
+        owner.presentation().connection,
         ConnectionState::Disconnected
     );
-    assert_eq!(
-        owner.presentation(false).actions,
-        vec![SetupAction::Connect]
-    );
+    assert_eq!(owner.presentation().actions, vec![SetupAction::Connect]);
     owner.begin_account(Some(123));
+    owner.restore_account(None, 123, 1001).unwrap_err();
     assert_eq!(
-        owner.presentation(true).discovery,
-        DiscoveryState::InterruptedRefresh
+        owner.presentation().discovery,
+        DiscoveryState::AuthorizationRequired
     );
-    assert_eq!(
-        owner.presentation(true).actions,
-        vec![SetupAction::Reconnect]
-    );
+    assert_eq!(owner.presentation().actions, vec![SetupAction::Reconnect]);
+    owner
+        .restore_account(Some(&record(123).serialize().unwrap()), 123, 1001)
+        .unwrap();
     let mut selections = Selections::default();
     let mut transport = Transport {
         replies: [
@@ -301,7 +299,7 @@ fn coordinator_presentation_follows_owned_setup_states_and_redacts_actions() {
     owner
         .discover(&mut transport, &mut selections, &record(123), 1001)
         .unwrap();
-    let view = owner.presentation(false);
+    let view = owner.presentation();
     assert_eq!(view.discovery, DiscoveryState::Candidate);
     assert_eq!(view.occupancy, OccupancyState::Unknown);
     assert!(!format!("{view:?}").contains("synthetic-mat"));
@@ -315,14 +313,14 @@ fn coordinator_presentation_follows_owned_setup_states_and_redacts_actions() {
         )
         .unwrap();
     assert_eq!(
-        owner.presentation(false).subscription,
+        owner.presentation().subscription,
         SubscriptionState::Incomplete
     );
     owner
         .discover(&mut transport, &mut selections, &record(123), 1001)
         .unwrap();
     owner.set_lifecycle(niles_withings::lifecycle::Status::Ready);
-    let view = owner.presentation(false);
+    let view = owner.presentation();
     assert_eq!(view.discovery, DiscoveryState::Selected);
     assert_eq!(view.subscription, SubscriptionState::Ready);
     assert_eq!(view.occupancy, OccupancyState::Unknown);
@@ -330,19 +328,13 @@ fn coordinator_presentation_follows_owned_setup_states_and_redacts_actions() {
     owner
         .discover(&mut transport, &mut selections, &record(123), 1001)
         .unwrap();
-    assert_eq!(
-        owner.presentation(false).discovery,
-        DiscoveryState::Candidate
-    );
+    assert_eq!(owner.presentation().discovery, DiscoveryState::Candidate);
     owner
         .discover(&mut transport, &mut selections, &record(123), 1001)
         .unwrap_err();
+    assert_eq!(owner.presentation().discovery, DiscoveryState::Unavailable);
     assert_eq!(
-        owner.presentation(false).discovery,
-        DiscoveryState::Unavailable
-    );
-    assert_eq!(
-        owner.presentation(false).actions,
+        owner.presentation().actions,
         vec![SetupAction::RetryDiscovery]
     );
 }
@@ -369,13 +361,13 @@ fn presentation_multiple_empty_stale_and_pending() {
         .discover(&mut t, &mut selections, &record(123), 1001)
         .unwrap();
     assert_eq!(
-        owner.presentation(false).discovery,
+        owner.presentation().discovery,
         DiscoveryState::NoEligibleMats
     );
     owner
         .discover(&mut t, &mut selections, &record(123), 1001)
         .unwrap();
-    let v = owner.presentation(false);
+    let v = owner.presentation();
     assert_eq!(v.discovery, DiscoveryState::MultipleCandidates);
     assert_eq!(v.candidates.len(), 2);
     assert_eq!(v.actions.len(), 2);
@@ -389,22 +381,77 @@ fn presentation_multiple_empty_stale_and_pending() {
             Events::default(),
         )
         .unwrap();
-    let v = owner.presentation(false);
+    let v = owner.presentation();
     assert_eq!(v.discovery, DiscoveryState::Selected);
     assert!(v.selected.is_some());
     owner.set_lifecycle(niles_withings::lifecycle::Status::Ready);
-    assert_ne!(
-        owner.presentation(true).subscription,
-        SubscriptionState::Ready
-    );
-    assert!(owner.presentation(true).selected.is_none());
+    owner.restore_account(None, 123, 1001).unwrap_err();
+    assert_ne!(owner.presentation().subscription, SubscriptionState::Ready);
+    assert!(owner.presentation().selected.is_none());
+    owner
+        .restore_account(Some(&record(123).serialize().unwrap()), 123, 1001)
+        .unwrap();
     owner
         .discover(&mut t, &mut selections, &record(123), 1001)
         .unwrap();
-    let v = owner.presentation(false);
+    let v = owner.presentation();
     assert_eq!(v.discovery, DiscoveryState::StaleSelection);
     assert!(v.selected.is_none());
     assert_eq!(v.actions, vec![SetupAction::SwitchMat]);
+}
+#[test]
+fn restore_failure_revokes_delivery_and_requires_validated_recovery() {
+    use niles_withings::{
+        application::WebhookRequest,
+        coordinator::{Coordinator, ScopedStore, SetupAction},
+    };
+    let valid = record(123).serialize().unwrap();
+    let mut pending: serde_json::Value = serde_json::from_str(&valid).unwrap();
+    pending["version"] = 2.into();
+    pending["refresh_pending"] = true.into();
+    let foreign = record(999).serialize().unwrap();
+    for raw in [
+        None,
+        Some("broken".to_string()),
+        Some(pending.to_string()),
+        Some(foreign),
+    ] {
+        let mut c = Coordinator::<ScopedStore<Shared>, Shared>::default();
+        let shared = Shared::default();
+        let mut s = Selections::default();
+        c.restore_account(Some(&valid), 123, 1001).unwrap();
+        let mut t = Transport {
+            replies: [devices(MAT), devices(MAT)].into(),
+            calls: 0,
+        };
+        c.discover(&mut t, &mut s, &record(123), 1001).unwrap();
+        c.accept_scoped(
+            &mut s,
+            "synthetic-mat",
+            c.generation(),
+            shared.clone(),
+            shared.clone(),
+        )
+        .unwrap();
+        let e = WebhookRequest {
+            method: "POST".into(),
+            content_type: "application/x-www-form-urlencoded".into(),
+            body: b"userid=123&deviceid=synthetic-mat&appli=50&date=1001".to_vec(),
+        };
+        assert_eq!(c.webhook(&e, 1001, 0, 0).status, 200);
+        c.restore_account(raw.as_deref(), 123, 1001).unwrap_err();
+        c.begin_account(Some(123));
+        assert_eq!(c.webhook(&e, 1001, 0, 0).status, 503);
+        assert_eq!(c.presentation().actions, vec![SetupAction::Reconnect]);
+        assert!(c.discover(&mut t, &mut s, &record(123), 1001).is_err());
+        assert_eq!(t.calls, 1);
+        c.restore_account(Some(&valid), 123, 1001).unwrap();
+        c.discover(&mut t, &mut s, &record(123), 1001).unwrap();
+        c.activate_scoped(&mut s, 123, shared.clone(), shared.clone())
+            .unwrap();
+        assert_eq!(c.webhook(&e, 1001, 0, 0).status, 200);
+        assert_eq!(shared.0.borrow().actions, vec!["bed_in"]);
+    }
 }
 const MAT: &str =
     r#"{"deviceid":"synthetic-mat","type":"Sleep Monitor","model":"Aura Sensor","model_id":61}"#;

@@ -74,6 +74,14 @@ pub enum SetupStatus {
     Configured,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AccountRecoveryStatus {
+    NotChecked,
+    Validated,
+    ReconnectRequired,
+    InterruptedRefresh,
+}
+
 /// Host-neutral setup presentation derived from coordinator ownership.
 #[derive(Clone, PartialEq, Eq)]
 pub struct SetupView {
@@ -94,6 +102,7 @@ pub enum ConnectionState {
 pub enum DiscoveryState {
     NotStarted,
     InterruptedRefresh,
+    AuthorizationRequired,
     NoEligibleMats,
     Unavailable,
     Candidate,
@@ -185,6 +194,7 @@ pub struct Coordinator<S: Store, H: Sink> {
     lifecycle_ready: bool,
     choosing: bool,
     discovery_failed: bool,
+    recovery: AccountRecoveryStatus,
     marker: PhantomData<(S, H)>,
 }
 impl<S: Store, H: Sink> Default for Coordinator<S, H> {
@@ -199,6 +209,7 @@ impl<S: Store, H: Sink> Default for Coordinator<S, H> {
             lifecycle_ready: false,
             choosing: false,
             discovery_failed: false,
+            recovery: AccountRecoveryStatus::NotChecked,
             marker: PhantomData,
         }
     }
@@ -258,8 +269,43 @@ impl<S: Store, H: Sink> Coordinator<S, H> {
     pub fn generation(&self) -> u64 {
         self.generation
     }
-    pub fn presentation(&self, pending_recovery: bool) -> SetupView {
+    pub fn restore_account(
+        &mut self,
+        serialized: Option<&str>,
+        account: u64,
+        now: i64,
+    ) -> Result<
+        (
+            crate::withings_client::TokenSet,
+            crate::lifecycle::TokenMetadata,
+        ),
+        application::ApplicationError,
+    > {
+        // Explicit restoration always revokes prior runtime ownership, even for the same account.
+        self.begin_account(Some(account));
+        self.adapter = None;
+        self.binding = None;
+        self.discovered = None;
+        self.lifecycle_ready = false;
+        self.generation = self.generation.wrapping_add(1);
+        self.recovery = AccountRecoveryStatus::ReconnectRequired;
+        self.setup = SetupStatus::AccountRequired;
+        let raw = serialized.ok_or(application::ApplicationError::InvalidRecord)?;
+        let restored = SecureAccountRecord::restore(raw, account, now).inspect_err(|error| {
+            if *error == application::ApplicationError::RecoveryRequired {
+                self.recovery = AccountRecoveryStatus::InterruptedRefresh;
+            }
+        })?;
+        self.recovery = AccountRecoveryStatus::Validated;
+        self.setup = SetupStatus::SelectionNeeded;
+        Ok(restored)
+    }
+    pub fn presentation(&self) -> SetupView {
         use crate::application::SetupResolution;
+        let pending_recovery = matches!(
+            self.recovery,
+            AccountRecoveryStatus::ReconnectRequired | AccountRecoveryStatus::InterruptedRefresh
+        );
         let resolution = self
             .discovered
             .as_ref()
@@ -280,7 +326,11 @@ impl<S: Store, H: Sink> Coordinator<S, H> {
                 action_id: binding.identity().device_id,
             });
         let discovery = if pending_recovery {
-            DiscoveryState::InterruptedRefresh
+            if self.recovery == AccountRecoveryStatus::InterruptedRefresh {
+                DiscoveryState::InterruptedRefresh
+            } else {
+                DiscoveryState::AuthorizationRequired
+            }
         } else {
             match resolution {
                 None if selected.is_some() => DiscoveryState::Selected,
@@ -379,6 +429,7 @@ impl<S: Store, H: Sink> Coordinator<S, H> {
             self.discovered = None;
             self.lifecycle_ready = false;
             self.generation = self.generation.wrapping_add(1);
+            self.recovery = AccountRecoveryStatus::NotChecked;
         }
         self.choosing = false;
         self.account = account;
@@ -422,6 +473,12 @@ impl<S: Store, H: Sink> Coordinator<S, H> {
         record: &SecureAccountRecord,
         now: i64,
     ) -> Result<SetupStatus, application::ApplicationError> {
+        if matches!(
+            self.recovery,
+            AccountRecoveryStatus::ReconnectRequired | AccountRecoveryStatus::InterruptedRefresh
+        ) {
+            return Err(application::ApplicationError::RecoveryRequired);
+        }
         let Some(account) = self.account else {
             self.discovery_failed();
             return Ok(self.setup);
@@ -481,6 +538,12 @@ impl<S: Store, H: Sink> Coordinator<S, H> {
         sink_store: S,
         sink: H,
     ) -> Result<(), application::ApplicationError> {
+        if matches!(
+            self.recovery,
+            AccountRecoveryStatus::ReconnectRequired | AccountRecoveryStatus::InterruptedRefresh
+        ) {
+            return Err(application::ApplicationError::RecoveryRequired);
+        }
         let Some(account) = self.account else {
             return Err(application::ApplicationError::InvalidSelection);
         };
@@ -516,6 +579,12 @@ impl<S: Store, H: Sink> Coordinator<S, H> {
         self.adapter = None;
         self.binding = None;
         self.lifecycle_ready = false;
+        if matches!(
+            self.recovery,
+            AccountRecoveryStatus::ReconnectRequired | AccountRecoveryStatus::InterruptedRefresh
+        ) {
+            return Err(application::ApplicationError::RecoveryRequired);
+        }
         if self.account != Some(account) {
             return Err(application::ApplicationError::InvalidSelection);
         }
