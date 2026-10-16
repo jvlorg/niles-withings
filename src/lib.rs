@@ -158,6 +158,9 @@ pub mod provider {
 /// wired into the Niles component: the pinned host has no secret-store API.
 pub mod withings_client;
 
+/// Offline, host-neutral token and subscription lifecycle.
+pub mod lifecycle;
+
 pub mod presence {
     use crate::{
         config::Identity,

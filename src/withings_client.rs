@@ -243,6 +243,47 @@ pub fn refresh<T: HttpTransport, S: SecretStore>(
         .map_err(|_| ClientError::Storage)?;
     Ok(tokens)
 }
+/// Refresh while enforcing account identity before the durable store is called.
+/// A foreign-account response is never persisted.
+pub fn refresh_bound<T: HttpTransport, S: SecretStore>(
+    t: &mut T,
+    s: &mut S,
+    client_id: &str,
+    client_secret: &Secret,
+    refresh_token: &Secret,
+    expected_user: u64,
+) -> Result<TokenSet, ClientError> {
+    if expected_user == 0 {
+        return Err(ClientError::InvalidInput);
+    }
+    struct BoundStore<'a, S> {
+        inner: &'a mut S,
+        expected: u64,
+        mismatch: bool,
+    }
+    impl<S: SecretStore> SecretStore for BoundStore<'_, S> {
+        type Error = ();
+        fn replace_tokens(&mut self, tokens: &TokenSet) -> Result<(), ()> {
+            if tokens.user_id != self.expected {
+                self.mismatch = true;
+                return Err(());
+            }
+            self.inner.replace_tokens(tokens).map_err(|_| ())
+        }
+    }
+    let mut bound = BoundStore {
+        inner: s,
+        expected: expected_user,
+        mismatch: false,
+    };
+    let result = refresh(t, &mut bound, client_id, client_secret, refresh_token);
+    if bound.mismatch {
+        Err(ClientError::ProviderStatus)
+    } else {
+        result
+    }
+}
+
 fn valid_callback(raw: &str) -> Result<(), ClientError> {
     if raw.len() > CALLBACK_MAX_BYTES
         || raw
@@ -418,6 +459,28 @@ pub fn list_subscriptions<T: HttpTransport>(
     }
     Ok(all)
 }
+/// Subscribe one supported category. The caller owns reconciliation and readback.
+pub fn subscribe_category<T: HttpTransport>(
+    t: &mut T,
+    token: &Secret,
+    callback: &CallbackUrl,
+    comment: &str,
+    appli: u8,
+) -> Result<(), ClientError> {
+    if comment.len() > 256 || !(appli == BED_APPLI || appli == BED_APPLI_OUT) {
+        return Err(ClientError::InvalidInput);
+    }
+    notify(
+        t,
+        token,
+        "subscribe",
+        &[
+            ("callbackurl", callback.as_str()),
+            ("appli", if appli == BED_APPLI { "50" } else { "51" }),
+            ("comment", comment),
+        ],
+    )
+}
 /// Both categories must succeed; errors do not certify a healthy complete subscription.
 pub fn subscribe_bed<T: HttpTransport>(
     t: &mut T,
@@ -425,20 +488,8 @@ pub fn subscribe_bed<T: HttpTransport>(
     callback: &CallbackUrl,
     comment: &str,
 ) -> Result<(), ClientError> {
-    if comment.len() > 256 {
-        return Err(ClientError::InvalidInput);
-    }
-    for appli in ["50", "51"] {
-        notify(
-            t,
-            token,
-            "subscribe",
-            &[
-                ("callbackurl", callback.as_str()),
-                ("appli", appli),
-                ("comment", comment),
-            ],
-        )?;
+    for appli in [BED_APPLI, BED_APPLI_OUT] {
+        subscribe_category(t, token, callback, comment, appli)?;
     }
     Ok(())
 }
