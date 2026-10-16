@@ -161,6 +161,9 @@ pub mod withings_client;
 /// Offline, host-neutral token and subscription lifecycle.
 pub mod lifecycle;
 
+/// Host-neutral executable account, callback and webhook application boundary.
+pub mod application;
+
 pub mod presence {
     use crate::{
         config::Identity,
@@ -400,8 +403,8 @@ pub mod adapter {
     }
     pub fn host_action(action: &'static str) -> Option<&'static str> {
         match action {
-            "bed_in" => Some("in_bed"),
-            "bed_out" => Some("out_of_bed"),
+            "bed_in" => Some("bed_in"),
+            "bed_out" => Some("bed_out"),
             _ => None,
         }
     }

@@ -66,7 +66,7 @@ fn persists_before_actions_and_duplicate_restart_is_silent() {
         &[
             "save",
             "reading:Occupied { occupied: true, observed_at: 1000 }",
-            "action:in_bed"
+            "action:bed_in"
         ]
     );
     let mut b = Adapter::new(id(), shared.clone(), shared.clone()).unwrap();
@@ -77,7 +77,7 @@ fn persists_before_actions_and_duplicate_restart_is_silent() {
             .borrow()
             .calls
             .iter()
-            .filter(|x| x.as_str() == "action:in_bed")
+            .filter(|x| x.as_str() == "action:bed_in")
             .count(),
         1
     );
@@ -102,12 +102,12 @@ fn action_sink_failure_is_reported_as_ambiguous_after_commit() {
     assert!(matches!(
         a.deliver(event(50, 1000).as_bytes(), 1000, 100, 0),
         Err(DeliveryError::ActionSink {
-            action: "in_bed",
+            action: "bed_in",
             ..
         })
     ));
     assert!(shared.0.borrow().state.is_some());
-    assert!(shared.0.borrow().calls.iter().any(|x| x == "action:in_bed"));
+    assert!(shared.0.borrow().calls.iter().any(|x| x == "action:bed_in"));
 }
 #[test]
 fn malformed_input_has_no_side_effects() {
@@ -176,8 +176,8 @@ fn restored_conflicting_event_publishes_unknown_without_an_action() {
 
 #[test]
 fn event_to_host_boundary_maps_direction_and_status_truthfully() {
-    assert_eq!(host_action("bed_in"), Some("in_bed"));
-    assert_eq!(host_action("bed_out"), Some("out_of_bed"));
+    assert_eq!(host_action("bed_in"), Some("bed_in"));
+    assert_eq!(host_action("bed_out"), Some("bed_out"));
     assert_eq!(host_action("unknown"), None);
     let mut state = State::new(id());
     assert_eq!(
@@ -211,7 +211,7 @@ fn event_to_host_boundary_maps_direction_and_status_truthfully() {
             observed_at: 1000
         }
     );
-    assert_eq!(mapped.action, Some("in_bed"));
+    assert_eq!(mapped.action, Some("bed_in"));
     assert_eq!(
         Model::from_state(&state, Connection::Connected).lines(),
         [

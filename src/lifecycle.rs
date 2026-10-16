@@ -10,7 +10,7 @@ use crate::withings_client::{
 };
 use std::fmt;
 
-const MAX_TOKEN_LIFETIME: u64 = 31 * 24 * 60 * 60;
+pub const MAX_TOKEN_LIFETIME: u64 = 31 * 24 * 60 * 60;
 const REFRESH_LEAD: i64 = 300;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -30,6 +30,12 @@ impl TokenMetadata {
             acquired_at: now,
             expires_at,
         })
+    }
+    pub fn new_for_account(
+        now: i64,
+        lifetime: u64,
+    ) -> Result<Self, crate::application::ApplicationError> {
+        Self::new(now, lifetime).map_err(|_| crate::application::ApplicationError::InvalidRecord)
     }
     fn valid_at(self, now: i64) -> bool {
         now > 0

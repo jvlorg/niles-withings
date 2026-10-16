@@ -214,6 +214,35 @@ pub fn exchange_code<T: HttpTransport, S: SecretStore>(
         .map_err(|_| ClientError::Storage)?;
     Ok(tokens)
 }
+/// Exchange an authorization code without persistence for an atomic lifecycle writer.
+pub fn exchange_code_unstored<T: HttpTransport>(
+    t: &mut T,
+    client_id: &str,
+    client_secret: &Secret,
+    code: &Secret,
+    callback: &str,
+) -> Result<TokenSet, ClientError> {
+    if client_id.is_empty() || client_id.len() > 256 || valid_callback(callback).is_err() {
+        return Err(ClientError::InvalidInput);
+    }
+    let f = form(&[
+        ("action", "requesttoken"),
+        ("grant_type", "authorization_code"),
+        ("client_id", client_id),
+        ("client_secret", client_secret.expose_secret()),
+        ("code", code.expose_secret()),
+        ("redirect_uri", callback),
+    ]);
+    token_response(
+        t.post(HttpRequest {
+            url: TOKEN_URL,
+            form: f,
+            bearer: None,
+        })
+        .map_err(|_| ClientError::Transport)?,
+        client_id,
+    )
+}
 pub fn refresh<T: HttpTransport, S: SecretStore>(
     t: &mut T,
     s: &mut S,

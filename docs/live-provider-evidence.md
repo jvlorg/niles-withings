@@ -25,12 +25,12 @@ Redacted shape only, NOT a verbatim wire payload:
 
 Johan reported lying down during the test. Exact physical movement timestamps were not recorded; the exit was not separately timestamp-confirmed. These two observations establish real event receipt, not guaranteed physical-to-event latency, an overnight sample, SLA, or immediate night-light suitability. Timestamp subtraction depends on clock alignment.
 
-## Remaining questions for the spec
-1. The proposal says to verify bed-in/out through a data API before reporting. No current-occupancy refetch endpoint is established for notification-only50/51. Identify that endpoint or explicitly define the capability-URL trust model and limitations; historical sleep data is not a substitute. Matching body IDs is not sender authentication.
-2. HEAD reachability validation of the registered OAuth callback must work without interactive login, while actual OAuth completion remains bound to the initiating browser/state. Notification HEAD can be host-handled as proposed.
-3. Specify acknowledgement versus durable processing/retry ownership. Fast acknowledgement plus deferred processing needs restart-safe handoff; current add-on storage-first action adapter is at-most-once attempt, not guaranteed delivery.
-4. Full hook URL discovery, stable token persistence/rotation, and encrypted read-after-write token semantics should be explicit. Do not choose new manifest permission syntax before the upstream spec.
-5. V1 sensor/actions suffice; unknown must remain distinct from out-of-bed. Final host action names should align with proposed `in_bed`/`out_of_bed`; current core's internal `bed_in`/`bed_out` needs deliberate adapter mapping when interface0.3 is integrated.
+## Remaining questions for the spec (historical notes; PR #439 resolved relevant contract items)
+1. Identity/date/dedup plus host capability authentication is the accepted contract; no occupancy refetch for notification-only 50/51. This resolves the earlier question as a SPEC requirement, not evidence of deployed host behavior or cryptographic provider-origin authentication.
+2. HEAD reachability validation of the registered OAuth callback must work without interactive login, while actual OAuth completion remains bound to the initiating browser/state. PR #439 specifies empty 200 before state consumption/add-on invocation.
+3. Post-commit retry-loss remains a delivery limitation: acknowledge after durable state/action processing; current adapter is persist-before-publish and at-most-once attempt.
+4. PR #439 specifies per-value atomic encrypted secret persistence and callback URL from configured public_url without Host fallback. Host implementation/wiring and tests remain pending.
+5. V1 sensor/actions suffice; unknown must remain distinct from out-of-bed. The approved add-on contract retains the exact core action names `bed_in`/`bed_out`; no translation to `in_bed`/`out_of_bed`.
 
 ## State
 Evidence ready for Johan to share; not posted upstream by agent. Niles host extension remains docs-spec-first, then review, then implementation. Temporary harness is only for evidence gathering and is not a permanent relay architecture.

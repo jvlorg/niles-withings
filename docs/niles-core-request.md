@@ -1,6 +1,6 @@
 # Request for Mark: generic add-on callbacks and OAuth secret persistence
 
-Draft for Johan to review/send. Not posted upstream. Based on Niles `457821d5b210f8005b42868ad6786687bbcf248c`.
+Historical draft for Johan to review/send. Not posted upstream. Superseded as the proposed contract by docs-only Niles PR #439 at `d6d70e0c0a835c9e025d664f5dbc1cc2b0f655b7`; this does not establish that interface 0.3 is implemented or that current upstream HEAD has been validated.
 
 ## Why
 
@@ -41,6 +41,12 @@ No Withings-specific core routes, built-in Withings integration or custom fork i
 3. Disabled/removed/update/restart behavior and overload acceptance policy tested; no acknowledged silent loss.
 4. Token mutation stays plugin-scoped and encrypted; persistence failures surfaced; no secret leakage in logs or ordinary config reads.
 5. Synthetic callback → add-on state/action → Niles automation proof; no household device commands needed for the test.
+
+## Current PR #439 contract (resolved SPEC; implementation pending)
+
+The proposal specifies host exports/imports for: `authorize-url(callback-url,state)`, `on-callback(callback-url,query,person)`, `on-webhook(request)`; host-owned browser state/cookie/person validation with `state` removed before callback; plugin-scoped encrypted secrets get/set/delete; a webhook capability token checked by host; host-managed callback HEAD; and `inbound.hook-url()` based on required trusted `[api] public_url`. The host contract is PR #439 at `03c4b55c09861d8ac34b50df1cd5305752cc1063`, verified by Main: callback HEAD is empty 200 before auth/state consumption/add-on invocation; each secret value is atomically committed before `ok` and failed writes retain prior value; no plaintext-secret guidance; callback URLs use configured `public_url` only, never Host fallback. These are resolved SPEC requirements, not pending design questions. The interface remains docs-only: no WIT 0.3 implementation or implementation tests yet. `secrets.set` is atomic per value, so tokens+timing are stored as one <=4 KiB serialized record. Host encryption remains host responsibility; host wiring/validation is pending.
+
+For this add-on, identity/date/dedup plus host capability authentication is the accepted notification validation; do not add a current-occupancy fetch. Provider action names are retained exactly as `bed_in` and `bed_out`. Device selection remains manual because no component discovery UI has been implemented; avoid guessing device schema or removing the setting.
 
 ## Provider references and limits
 
