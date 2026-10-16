@@ -171,12 +171,29 @@ fn setting(key: &str) -> Result<String, String> {
         _ => Err(format!("Required setting {key} missing")),
     }
 }
+fn configured_account() -> Result<Option<u64>, String> {
+    match config::get("user_id") {
+        None => Ok(None),
+        Some(config::SettingValue::Text(value)) => value
+            .parse::<u64>()
+            .ok()
+            .filter(|n| *n > 0)
+            .map(Some)
+            .ok_or_else(|| "Configured user_id must be a positive integer".into()),
+        _ => Err("Configured user_id must be a positive integer".into()),
+    }
+}
 fn account_id() -> Result<u64, String> {
-    setting("user_id")?
-        .parse()
-        .ok()
-        .filter(|n| *n > 0)
-        .ok_or_else(|| "Configured user_id must be a positive integer".into())
+    let configured = configured_account()?;
+    let raw = HostStore.read_account_record()?;
+    let raw = raw.ok_or("Withings account is not connected")?;
+    let identity =
+        niles_withings::application::SecureAccountRecord::authenticated_identity(&raw, now()?)
+            .map_err(|_| "Account restore failed")?;
+    if configured.is_some_and(|expected| expected != identity) {
+        return Err("Connected account does not match configured account".into());
+    }
+    Ok(identity)
 }
 #[cfg(test)]
 fn now() -> Result<i64, String> {
@@ -215,7 +232,15 @@ fn reconcile_owner(owner: &mut Owner<HostStore, DeviceSink>) -> Result<(), Strin
 }
 #[allow(clippy::collapsible_if)]
 fn activate_saved() -> Result<(), String> {
-    let account = account_id()?;
+    let account = match account_id() {
+        Ok(account) => account,
+        Err(_) => {
+            let mut owner = OWNER.with(|o| std::mem::replace(&mut *o.borrow_mut(), Owner::new()));
+            owner.pause();
+            OWNER.with(|o| *o.borrow_mut() = owner);
+            return Err("Account restore failed".into());
+        }
+    };
     let mut owner = OWNER.with(|o| std::mem::replace(&mut *o.borrow_mut(), Owner::new()));
     let result = (|| {
         let mut store = HostStore;
@@ -351,11 +376,23 @@ impl Guest for Plugin {
         use niles::integration::ui::{Node, NodeKind, TextBlock};
         use niles_withings::coordinator::{DiscoveryState, SubscriptionState};
         let view = OWNER.with(|o| o.borrow().presentation());
-        let account = match view.discovery {
-            DiscoveryState::AuthorizationRequired | DiscoveryState::InterruptedRefresh => {
-                "Reconnect Withings using the host Connect control."
+        let has_record = HostStore.read_account_record().ok().flatten().is_some();
+        let account = match (view.discovery, account_id().is_err(), has_record) {
+            (
+                DiscoveryState::AuthorizationRequired | DiscoveryState::InterruptedRefresh,
+                true,
+                true,
+            ) => "Reconnect Withings using the host Connect control.",
+            (_, true, true) => "Reconnect Withings using the host Connect control.",
+            (_, true, false) => "Connect Withings using the host Connect control.",
+            (
+                DiscoveryState::AuthorizationRequired | DiscoveryState::InterruptedRefresh,
+                false,
+                _,
+            ) => "Reconnect Withings using the host Connect control.",
+            (DiscoveryState::NotStarted, false, _) => {
+                "Connect Withings using the host Connect control."
             }
-            DiscoveryState::NotStarted => "Connect Withings using the host Connect control.",
             _ => "Withings account loaded.",
         };
         let mat = match view.discovery {
@@ -517,6 +554,7 @@ impl Guest for Plugin {
             devices::set_available(&s.target()?, false)
                 .map_err(|_| "Could not revoke availability".to_string())
         })?;
+        let expected_account = configured_account()?;
         let cb = withings_client::CallbackUrl::parse(&callback)
             .map_err(|_| "Invalid callback".to_string())?;
         let client = setting("client_id")?;
@@ -541,8 +579,9 @@ impl Guest for Plugin {
                 return Ok("Withings access was not granted; delivery is disabled.".into());
             }
             niles_withings::application::CallbackResult::Stored { user_id }
-                if user_id != account_id()? =>
+                if expected_account.is_some_and(|expected| expected != user_id) =>
             {
+                OWNER.with(|o| o.borrow_mut().pause());
                 return Err(
                     "Connected account does not match configured account; delivery is disabled."
                         .into(),

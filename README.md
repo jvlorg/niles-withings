@@ -1,6 +1,6 @@
 # Niles Withings
 
-Rust executable foundation for a standalone Niles Withings Sleep bed-presence add-on. Scope is in-bed / out-of-bed only; in-bed does not mean asleep. Historical sleep is V2; Body+ remains secondary and not yet implemented.
+Rust add-on for Withings Sleep bed-presence, onboarding and events. Scope is in-bed / out-of-bed only; in-bed does not mean asleep. Historical sleep is V2; Body+ remains secondary and not yet implemented.
 
 ## Implemented locally
 
@@ -8,11 +8,11 @@ Rust executable foundation for a standalone Niles Withings Sleep bed-presence ad
 - Deterministic-age-filtered presence reducer, Unknown/InBed/OutOfBed state, health distinct from observation, restart serialization, bounded dedup/cursor and conservative transition policy.
 - Offline synthetic replay CLI exercising parser/state and restart round trips.
 - Host-neutral delivery adapter around the same parser and state, with injected durable store and sink. It commits changed state before publishing readings/actions. Failed reading/action publication is not retried after commit; this is at-most-once attempt behavior, not reliable delivery or exactly-once.
-- Niles component setup validates user/device and a configurable room, registers a room-scoped sensor, and exposes a truthful disconnected status surface/tool. WIT is vendored at `component/wit/niles-integration.wit` (package 0.2.1; requires Niles 0.2.1+).
-- Offline-only Withings OAuth/notification request contracts and synthetic fixture tests live in `src/withings_client.rs`. They are intentionally disconnected from the component: no callback host API or encrypted mutable secret-store API exists in the pinned WIT.
+- Niles component supports host Connect OAuth; authenticated account identity is derived from a bounded validated encrypted record and restored on restart. No numeric Withings user ID is needed. Optional `user_id` restricts the accepted account; invalid values fail closed.
+- Sleep mats are discovered and selected explicitly through the component UI. Device selection remains ordinary non-secret storage and is account-bound; credentials remain only in the host encrypted secret store.
 - Offline-only `user.getdevice` discovery and account-bound Sleep Monitor candidate/selection logic are also transport-fixture tested. The current official catalogue lists Aura Dock/Aura Sensor models, not Withings Sleep Analyzer; discovery deliberately does not guess that model mapping. Existing component configuration remains manual until host UI wiring.
 
-The local Niles 0.2.1 checker and stand-in dev host (binary source commit not independently established) have now accepted and run this component offline; reproducible command: `scripts/verify-niles-host.sh <niles-0.2.1-cli> <absolute-scratch-output>`. This uses only the CLI checker and `plugin dev` synthetic settings, with no account/API connection or provider writes. The artifact remains development-only, not a release/production install.
+The pinned Niles 0.3 host checker and stand-in dev host can validate disconnected loading only; this is not live provider proof or a production installation.
 
 ## Local commands
 

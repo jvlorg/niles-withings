@@ -19,7 +19,7 @@ http = ["account.withings.com", "wbsapi.withings.net"]
 key = "user_id"
 label = "Withings user ID"
 type = "string"
-required = true
+required = false
 
 [[settings]]
 key = "device_id"

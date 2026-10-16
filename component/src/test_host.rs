@@ -19,6 +19,8 @@ struct Ledger {
     empty_inventory: bool,
     multiple_mats: bool,
     legacy_id: bool,
+    configured_user: Option<String>,
+    second_account: bool,
 }
 thread_local! { static LEDGER: RefCell<Ledger> = RefCell::new(Ledger::default()); }
 pub fn clock() -> Result<i64, String> {
@@ -31,7 +33,11 @@ pub mod config {
             match k {
                 "device_id" if super::LEDGER.with(|l| l.borrow().legacy_id) => "offline-mat",
                 "room" => "bedroom",
-                "user_id" => "123",
+                "user_id" => {
+                    return super::LEDGER
+                        .with(|l| l.borrow().configured_user.clone())
+                        .map(SettingValue::Text);
+                }
                 "client_id" => "fixture-client",
                 _ => return None,
             }
@@ -164,7 +170,13 @@ pub mod http {
         Ok(Response {
             status: 200,
             headers: vec![],
-            body: response.into_bytes(),
+            body: if LEDGER.with(|l| l.borrow().second_account) {
+                response
+                    .replace("\"userid\":123", "\"userid\":456")
+                    .into_bytes()
+            } else {
+                response.into_bytes()
+            },
         })
     }
 }
@@ -278,6 +290,31 @@ fn actual_callback_webhook_restart_and_denial() {
             Some(&false)
         )
     });
+}
+#[test]
+fn account_onboarding_without_user_setting_selects_and_restores_mat() {
+    reset();
+    Plugin::init().unwrap();
+    assert!(connect().unwrap().contains("select a mat"));
+    let selected = choose_rendered(0);
+    assert_eq!(selected, "offline-mat");
+    assert_eq!(Plugin::on_webhook(event(50)).status, 200);
+    Plugin::stop();
+    Plugin::init().unwrap();
+    assert!(panel().contains("Configured sleep mat selected"));
+    assert_eq!(Plugin::on_webhook(event(50)).status, 200);
+    LEDGER.with(|l| assert_eq!(l.borrow().actions.len(), 1));
+}
+#[test]
+fn malformed_pending_and_account_switch_do_not_reuse_saved_mat_or_deliver() {
+    reset();
+    Plugin::init().unwrap();
+    connect().unwrap();
+    choose_rendered(0);
+    LEDGER.with(|l| l.borrow_mut().secrets.insert("account".into(), "{".into()));
+    Plugin::stop();
+    Plugin::init().unwrap();
+    assert_eq!(Plugin::on_webhook(event(50)).status, 503);
 }
 #[test]
 fn timer_rotation_final_save_failure_revokes_and_restart_refuses() {
@@ -531,6 +568,55 @@ fn legacy_configured_mat_activates_once_and_callback_is_truthful() {
     assert!(connect().unwrap().contains("select a mat"));
     assert_eq!(Plugin::on_webhook(event(50)).status, 503);
 }
+#[test]
+fn account_restrictions_and_damaged_records_fail_closed() {
+    for expected in ["bad", "999"] {
+        reset();
+        Plugin::init().unwrap();
+        LEDGER.with(|l| l.borrow_mut().configured_user = Some(expected.into()));
+        assert!(connect().is_err());
+        assert_eq!(Plugin::on_webhook(event(50)).status, 503);
+    }
+    reset();
+    Plugin::init().unwrap();
+    connect().unwrap();
+    choose_rendered(0);
+    let valid = LEDGER.with(|l| l.borrow().secrets["account"].clone());
+    for damaged in [
+        "{".to_string(),
+        valid.replace("\"version\":1", "\"version\":99"),
+    ] {
+        Plugin::stop();
+        LEDGER.with(|l| {
+            l.borrow_mut().secrets.insert("account".into(), damaged);
+        });
+        let before = LEDGER.with(|l| l.borrow().requests.len());
+        Plugin::init().unwrap();
+        assert_eq!(Plugin::on_webhook(event(50)).status, 503);
+        assert_eq!(LEDGER.with(|l| l.borrow().requests.len()), before);
+        assert!(panel().contains("Reconnect Withings"));
+    }
+}
+#[test]
+fn replacement_account_does_not_inherit_mat_or_old_events() {
+    reset();
+    Plugin::init().unwrap();
+    connect().unwrap();
+    choose_rendered(0);
+    assert_eq!(Plugin::on_webhook(event(50)).status, 200);
+    let saved = LEDGER.with(|l| l.borrow().storage["selection"].clone());
+    LEDGER.with(|l| l.borrow_mut().second_account = true);
+    let _ = connect(); // Foreign persisted selection may explicitly block setup.
+    assert_eq!(Plugin::on_webhook(event(50)).status, 503);
+    assert!(OWNER.with(|o| o.borrow().presentation().selected.is_none()));
+    assert_eq!(
+        LEDGER.with(|l| l.borrow().storage["selection"].clone()),
+        saved
+    );
+    Plugin::stop();
+    Plugin::init().unwrap();
+    assert_eq!(Plugin::on_webhook(event(50)).status, 503);
+}
 fn panel() -> String {
     let tree = Plugin::render(
         "withings".into(),
@@ -554,7 +640,7 @@ fn panel() -> String {
 fn panel_tracks_fresh_events_and_recovery_without_exposing_identifiers() {
     reset();
     Plugin::init().unwrap();
-    assert!(panel().contains("Reconnect Withings"));
+    assert!(panel().contains("Connect Withings"));
     assert!(panel().contains("Occupancy unknown"));
     connect().unwrap();
     choose_rendered(0);

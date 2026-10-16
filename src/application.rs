@@ -52,6 +52,21 @@ impl fmt::Debug for SecureAccountRecord {
     }
 }
 impl SecureAccountRecord {
+    /// Discover the account identity from a bounded validated complete record.
+    /// Pending refreshes, expiry and malformed records are not identities.
+    pub fn authenticated_identity(serialized: &str, now: i64) -> Result<u64, ApplicationError> {
+        if serialized.len() > MAX_RECORD_BYTES {
+            return Err(ApplicationError::InvalidRecord);
+        }
+        let wire: AccountRecordWire =
+            serde_json::from_str(serialized).map_err(|_| ApplicationError::InvalidRecord)?;
+        let user = wire.user_id;
+        let (tokens, _) = Self::restore(serialized, user, now)?;
+        if tokens.user_id == 0 {
+            return Err(ApplicationError::InvalidRecord);
+        }
+        Ok(tokens.user_id)
+    }
     pub fn from_tokens(
         tokens: &TokenSet,
         metadata: TokenMetadata,
