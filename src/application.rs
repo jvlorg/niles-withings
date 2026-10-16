@@ -128,14 +128,12 @@ impl SecureAccountRecord {
             expires_at: wire.expires_at,
             refresh_pending: wire.refresh_pending,
         };
-        if record.refresh_pending {
-            return Err(ApplicationError::RecoveryRequired);
-        }
         let lifetime = record
             .expires_at
             .checked_sub(record.acquired_at)
             .ok_or(ApplicationError::InvalidRecord)?;
-        if record.version != RECORD_VERSION
+        if !((record.version == RECORD_VERSION && !record.refresh_pending)
+            || (record.version == 2 && record.refresh_pending))
             || record.user_id != expected_user
             || record.access_token.0.is_empty()
             || record.access_token.0.len() > 8192
@@ -147,6 +145,9 @@ impl SecureAccountRecord {
             || now < record.acquired_at
         {
             return Err(ApplicationError::InvalidRecord);
+        }
+        if record.refresh_pending {
+            return Err(ApplicationError::RecoveryRequired);
         }
         let tokens = TokenSet {
             user_id: record.user_id,
@@ -328,7 +329,7 @@ impl<S: AccountSecretStore> crate::lifecycle::SecureTokenStore for S {
         metadata: TokenMetadata,
     ) -> Result<(), Self::Error> {
         let mut record = SecureAccountRecord::from_tokens(tokens, metadata)?;
-        // Old readers reject this version rather than ignoring the pending flag.
+        // Old readers must reject pending records, never reuse the old token.
         record.version = 2;
         record.refresh_pending = true;
         self.set_account_record(&record.serialize()?)

@@ -277,10 +277,34 @@ fn ambiguous_transport_failure_latches_runtime_and_persisted_restore() {
 fn malformed_unknown_version_oversized_pending_and_debug_are_fail_closed() {
     let mut disk = Disk::default();
     pending(&mut disk);
+    let mut wire: serde_json::Value = serde_json::from_str(&disk.bytes).unwrap();
+    assert_eq!(wire["version"], 2);
+    wire["refresh_pending"] = false.into();
+    assert_eq!(
+        SecureAccountRecord::restore(&wire.to_string(), 123, 4500),
+        Err(ApplicationError::InvalidRecord)
+    );
+    wire["version"] = 1.into();
+    wire["refresh_pending"] = true.into();
+    assert_eq!(
+        SecureAccountRecord::restore(&wire.to_string(), 123, 4500),
+        Err(ApplicationError::InvalidRecord)
+    );
     assert!(SecureAccountRecord::restore("not json", 123, 4500).is_err());
     let mut unknown: serde_json::Value = serde_json::from_str(&disk.bytes).unwrap();
     unknown["version"] = serde_json::json!(9);
     assert!(SecureAccountRecord::restore(&unknown.to_string(), 123, 4500).is_err());
+    unknown["user_id"] = serde_json::json!(999);
+    assert_eq!(
+        SecureAccountRecord::restore(&unknown.to_string(), 123, 4500),
+        Err(ApplicationError::InvalidRecord)
+    );
+    let mut foreign_pending: serde_json::Value = serde_json::from_str(&disk.bytes).unwrap();
+    foreign_pending["user_id"] = serde_json::json!(999);
+    assert_eq!(
+        SecureAccountRecord::restore(&foreign_pending.to_string(), 123, 4500),
+        Err(ApplicationError::InvalidRecord)
+    );
     assert_eq!(
         SecureAccountRecord::restore(&"x".repeat(4097), 123, 4500),
         Err(ApplicationError::InvalidRecord)
