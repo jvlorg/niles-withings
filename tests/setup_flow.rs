@@ -153,7 +153,9 @@ fn coordinator_scopes_mat_switch_restart_and_failures() {
         content_type: "application/x-www-form-urlencoded".into(),
         body: format!("userid={user}&deviceid={mat}&appli={appli}&date={date}").into_bytes(),
     };
-    owner.begin_account(Some(123));
+    owner
+        .restore_account(Some(&record(123).serialize().unwrap()), 123, 1001)
+        .unwrap();
     for mat in ["synthetic-mat", "matB", "synthetic-mat"] {
         owner.switch_device();
         assert_eq!(
@@ -197,6 +199,9 @@ fn coordinator_scopes_mat_switch_restart_and_failures() {
     let mut owner = Coordinator::<ScopedStore<Shared>, Shared>::default();
     owner.begin_account(Some(123));
     owner
+        .restore_account(Some(&record(123).serialize().unwrap()), 123, 1002)
+        .unwrap();
+    owner
         .discover(&mut transport, &mut selections, &record(123), 1002)
         .unwrap();
     shared.0.borrow_mut().fail_load = true;
@@ -236,6 +241,9 @@ fn coordinator_scopes_mat_switch_restart_and_failures() {
     shared.0.borrow_mut().fail_save = false;
     owner.begin_account(Some(999));
     owner
+        .restore_account(Some(&record(999).serialize().unwrap()), 999, 1003)
+        .unwrap();
+    owner
         .discover(&mut transport, &mut selections, &record(999), 1003)
         .unwrap();
     owner
@@ -272,7 +280,9 @@ fn coordinator_presentation_follows_owned_setup_states_and_redacts_actions() {
         ConnectionState::Disconnected
     );
     assert_eq!(owner.presentation().actions, vec![SetupAction::Connect]);
-    owner.begin_account(Some(123));
+    owner
+        .restore_account(Some(&record(123).serialize().unwrap()), 123, 1001)
+        .unwrap();
     owner.restore_account(None, 123, 1001).unwrap_err();
     assert_eq!(
         owner.presentation().discovery,
@@ -345,7 +355,9 @@ fn presentation_multiple_empty_stale_and_pending() {
         Coordinator, DiscoveryState, ScopedStore, SetupAction, SubscriptionState,
     };
     let mut owner = Coordinator::<ScopedStore<StateStore>, Events>::default();
-    owner.begin_account(Some(123));
+    owner
+        .restore_account(Some(&record(123).serialize().unwrap()), 123, 1001)
+        .unwrap();
     let mut selections = Selections::default();
     let rows = format!("{MAT},{}", MAT.replace("synthetic-mat", "matB"));
     let mut t = Transport {
@@ -453,6 +465,155 @@ fn restore_failure_revokes_delivery_and_requires_validated_recovery() {
         assert_eq!(shared.0.borrow().actions, vec!["bed_in"]);
     }
 }
+
+#[test]
+fn coordinator_discovery_requires_validated_startup_after_account_switches() {
+    use niles_withings::coordinator::{Coordinator, ScopedStore};
+    let mut owner = Coordinator::<ScopedStore<Shared>, Shared>::default();
+    let mut selections = Selections::default();
+    let mut transport = Transport {
+        replies: [devices(MAT)].into(),
+        calls: 0,
+    };
+    owner.begin_account(Some(123));
+    assert!(
+        owner
+            .discover(&mut transport, &mut selections, &record(123), 1001)
+            .is_err()
+    );
+    assert_eq!(transport.calls, 0);
+    owner.begin_account(Some(999));
+    owner.begin_account(Some(123));
+    assert!(
+        owner
+            .discover(&mut transport, &mut selections, &record(123), 1001)
+            .is_err()
+    );
+    assert_eq!(transport.calls, 0);
+    owner
+        .restore_account(Some(&record(123).serialize().unwrap()), 123, 1001)
+        .unwrap();
+    owner
+        .discover(&mut transport, &mut selections, &record(123), 1001)
+        .unwrap();
+    assert_eq!(transport.calls, 1);
+}
+
+#[test]
+fn failed_restore_rejects_stale_discovery_record_before_provider_call() {
+    use niles_withings::coordinator::{Coordinator, ScopedStore};
+    let valid = record(123).serialize().unwrap();
+    let mut pending: serde_json::Value = serde_json::from_str(&valid).unwrap();
+    pending["version"] = 2.into();
+    pending["refresh_pending"] = true.into();
+    for raw in ["broken".to_string(), pending.to_string()] {
+        let mut owner = Coordinator::<ScopedStore<Shared>, Shared>::default();
+        owner.begin_account(Some(123));
+        assert!(owner.restore_account(Some(&raw), 123, 1001).is_err());
+        let mut transport = Transport {
+            replies: [devices(MAT)].into(),
+            calls: 0,
+        };
+        assert!(
+            owner
+                .discover(
+                    &mut transport,
+                    &mut Selections::default(),
+                    &record(123),
+                    1001
+                )
+                .is_err()
+        );
+        assert_eq!(transport.calls, 0);
+        owner.restore_account(Some(&valid), 123, 1001).unwrap();
+        owner
+            .discover(
+                &mut transport,
+                &mut Selections::default(),
+                &record(123),
+                1001,
+            )
+            .unwrap();
+        assert_eq!(transport.calls, 1);
+    }
+}
+#[test]
+fn callback_recovery_through_coordinator_to_bed_event() {
+    use niles_withings::{
+        application::{AccountSecretStore, SecureAccountRecord, WebhookRequest, on_callback},
+        coordinator::{Coordinator, ScopedStore},
+        withings_client::{CallbackUrl, Secret},
+    };
+    #[derive(Default)]
+    struct Secrets(String);
+    impl AccountSecretStore for Secrets {
+        type Error = ();
+        fn set_account_record(&mut self, s: &str) -> Result<(), ()> {
+            self.0 = s.into();
+            Ok(())
+        }
+    }
+    let mut c = Coordinator::<ScopedStore<Shared>, Shared>::default();
+    let mut pending: serde_json::Value =
+        serde_json::from_str(&record(123).serialize().unwrap()).unwrap();
+    pending["version"] = 2.into();
+    pending["refresh_pending"] = true.into();
+    c.restore_account(Some(&pending.to_string()), 123, 1001)
+        .unwrap_err();
+    let shared = Shared::default();
+    let mut selections = Selections::default();
+    let mut secrets = Secrets::default();
+    struct FlowTransport {
+        replies: std::collections::VecDeque<HttpResponse>,
+        calls: usize,
+    }
+    impl HttpTransport for FlowTransport {
+        type Error = ();
+        fn post(&mut self, request: HttpRequest) -> Result<HttpResponse, ()> {
+            if self.calls == 0 {
+                assert!(request.form.starts_with("action=requesttoken&"));
+            } else {
+                assert_eq!(request.form, "action=getdevice");
+            }
+            self.calls += 1;
+            self.replies.pop_front().ok_or(())
+        }
+    }
+    let mut t=FlowTransport{replies:[HttpResponse{status:200,body:br#"{"status":0,"body":{"userid":123,"access_token":"callback-access","refresh_token":"callback-refresh","expires_in":3600,"scope":"user.sleepevents","token_type":"Bearer"}}"#.to_vec()},devices(MAT)].into(),calls:0};
+    on_callback(
+        &mut t,
+        &mut secrets,
+        &CallbackUrl::parse("https://example.com/callback").unwrap(),
+        &[("code".into(), "synthetic".into())],
+        None,
+        "client",
+        &Secret::new("secret").unwrap(),
+        1001,
+    )
+    .unwrap();
+    let (tokens, meta) = c.restore_account(Some(&secrets.0), 123, 1001).unwrap();
+    let restored = SecureAccountRecord::from_tokens(&tokens, meta).unwrap();
+    c.discover(&mut t, &mut selections, &restored, 1001)
+        .unwrap();
+    c.accept_scoped(
+        &mut selections,
+        "synthetic-mat",
+        c.generation(),
+        shared.clone(),
+        shared.clone(),
+    )
+    .unwrap();
+    assert!(shared.0.borrow().actions.is_empty());
+    let e = WebhookRequest {
+        method: "POST".into(),
+        content_type: "application/x-www-form-urlencoded".into(),
+        body: b"userid=123&deviceid=synthetic-mat&appli=50&date=1001".to_vec(),
+    };
+    assert_eq!(c.webhook(&e, 1001, 0, 0).status, 200);
+    assert_eq!(c.webhook(&e, 1001, 0, 0).status, 200);
+    assert_eq!(shared.0.borrow().actions, vec!["bed_in"]);
+    assert_eq!(t.calls, 2);
+}
 const MAT: &str =
     r#"{"deviceid":"synthetic-mat","type":"Sleep Monitor","model":"Aura Sensor","model_id":61}"#;
 
@@ -481,7 +642,9 @@ fn coordinator_account_switch_stale_generation_and_failed_save() {
         .into(),
         calls: 0,
     };
-    owner.begin_account(Some(123));
+    owner
+        .restore_account(Some(&record(123).serialize().unwrap()), 123, 1001)
+        .unwrap();
     owner
         .discover(&mut transport, &mut selections, &record(123), 1001)
         .unwrap();
@@ -529,6 +692,10 @@ fn coordinator_account_switch_stale_generation_and_failed_save() {
     owner.begin_account(Some(123));
     assert_eq!(owner.status(), SetupStatus::Configured);
     owner.begin_account(Some(999));
+    assert_ne!(owner.status(), SetupStatus::Configured);
+    owner
+        .restore_account(Some(&record(999).serialize().unwrap()), 999, 1001)
+        .unwrap();
     assert_eq!(owner.webhook(&request(123), 1001, 0, 0).status, 503);
     assert!(
         owner

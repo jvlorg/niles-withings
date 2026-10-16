@@ -429,7 +429,11 @@ impl<S: Store, H: Sink> Coordinator<S, H> {
             self.discovered = None;
             self.lifecycle_ready = false;
             self.generation = self.generation.wrapping_add(1);
-            self.recovery = AccountRecoveryStatus::NotChecked;
+            self.recovery = if account.is_some() {
+                AccountRecoveryStatus::ReconnectRequired
+            } else {
+                AccountRecoveryStatus::NotChecked
+            };
         }
         self.choosing = false;
         self.account = account;
@@ -473,10 +477,7 @@ impl<S: Store, H: Sink> Coordinator<S, H> {
         record: &SecureAccountRecord,
         now: i64,
     ) -> Result<SetupStatus, application::ApplicationError> {
-        if matches!(
-            self.recovery,
-            AccountRecoveryStatus::ReconnectRequired | AccountRecoveryStatus::InterruptedRefresh
-        ) {
+        if self.recovery != AccountRecoveryStatus::Validated {
             return Err(application::ApplicationError::RecoveryRequired);
         }
         let Some(account) = self.account else {
@@ -538,10 +539,7 @@ impl<S: Store, H: Sink> Coordinator<S, H> {
         sink_store: S,
         sink: H,
     ) -> Result<(), application::ApplicationError> {
-        if matches!(
-            self.recovery,
-            AccountRecoveryStatus::ReconnectRequired | AccountRecoveryStatus::InterruptedRefresh
-        ) {
+        if self.recovery != AccountRecoveryStatus::Validated {
             return Err(application::ApplicationError::RecoveryRequired);
         }
         let Some(account) = self.account else {
@@ -579,10 +577,7 @@ impl<S: Store, H: Sink> Coordinator<S, H> {
         self.adapter = None;
         self.binding = None;
         self.lifecycle_ready = false;
-        if matches!(
-            self.recovery,
-            AccountRecoveryStatus::ReconnectRequired | AccountRecoveryStatus::InterruptedRefresh
-        ) {
+        if self.recovery != AccountRecoveryStatus::Validated {
             return Err(application::ApplicationError::RecoveryRequired);
         }
         if self.account != Some(account) {
