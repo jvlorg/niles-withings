@@ -879,3 +879,120 @@ fn corrupt_foreign_and_stale_selection_fail_closed_without_switching() {
         SetupResolution::StaleSelection
     ));
 }
+
+#[test]
+fn unsafe_lifecycle_revokes_adapter_and_ready_cannot_restore_it() {
+    use niles_withings::{
+        application::WebhookRequest,
+        coordinator::{Coordinator, DiscoveryState, ScopedStore, SetupAction},
+        lifecycle::Status,
+    };
+    for status in [
+        Status::AuthorizationRequired,
+        Status::RefreshPersistenceFailed,
+    ] {
+        let mut owner = Coordinator::<ScopedStore<Shared>, Shared>::default();
+        let shared = Shared::default();
+        let mut selections = Selections::default();
+        let mut transport = Transport {
+            replies: [devices(MAT), devices(MAT)].into(),
+            calls: 0,
+        };
+        let event = WebhookRequest {
+            method: "POST".into(),
+            content_type: "application/x-www-form-urlencoded".into(),
+            body: b"userid=123&deviceid=synthetic-mat&appli=50&date=1001".to_vec(),
+        };
+        owner
+            .restore_account(Some(&record(123).serialize().unwrap()), 123, 1001)
+            .unwrap();
+        owner
+            .discover(&mut transport, &mut selections, &record(123), 1001)
+            .unwrap();
+        owner
+            .accept_scoped(
+                &mut selections,
+                "synthetic-mat",
+                owner.generation(),
+                shared.clone(),
+                shared.clone(),
+            )
+            .unwrap();
+        owner.set_lifecycle(Status::Ready);
+        assert_eq!(owner.webhook(&event, 1001, 0, 0).status, 200);
+        let stored = shared.0.borrow().values.clone();
+        let selected = selections.load_selection().unwrap();
+        owner.set_lifecycle(status);
+        assert_eq!(shared.0.borrow().values, stored);
+        assert_eq!(selections.load_selection().unwrap(), selected);
+        assert_eq!(owner.webhook(&event, 1001, 0, 0).status, 503);
+        let view = owner.presentation();
+        assert_eq!(view.discovery, DiscoveryState::AuthorizationRequired);
+        assert!(
+            view.actions
+                .iter()
+                .any(|action| matches!(action, SetupAction::Reconnect))
+        );
+        owner.set_lifecycle(Status::Ready);
+        assert_eq!(owner.webhook(&event, 1001, 0, 0).status, 503);
+        assert!(
+            owner
+                .discover(&mut transport, &mut selections, &record(123), 1001)
+                .is_err()
+        );
+        owner
+            .restore_account(Some(&record(123).serialize().unwrap()), 123, 1001)
+            .unwrap();
+        owner
+            .discover(&mut transport, &mut selections, &record(123), 1001)
+            .unwrap();
+        owner
+            .activate_scoped(&mut selections, 123, shared.clone(), shared.clone())
+            .unwrap();
+        owner.set_lifecycle(Status::Ready);
+        assert_eq!(owner.webhook(&event, 1001, 0, 0).status, 200);
+        assert_eq!(shared.0.borrow().actions, vec!["bed_in"]);
+    }
+}
+
+#[test]
+fn incomplete_subscriptions_preserve_valid_webhook_handler() {
+    use niles_withings::{
+        application::WebhookRequest,
+        coordinator::{Coordinator, ScopedStore, SubscriptionState},
+        lifecycle::Status,
+    };
+    let mut owner = Coordinator::<ScopedStore<StateStore>, Events>::default();
+    let mut selections = Selections::default();
+    let mut transport = Transport {
+        replies: [devices(MAT)].into(),
+        calls: 0,
+    };
+    let event = WebhookRequest {
+        method: "POST".into(),
+        content_type: "application/x-www-form-urlencoded".into(),
+        body: b"userid=123&deviceid=synthetic-mat&appli=50&date=1001".to_vec(),
+    };
+    owner
+        .restore_account(Some(&record(123).serialize().unwrap()), 123, 1001)
+        .unwrap();
+    owner
+        .discover(&mut transport, &mut selections, &record(123), 1001)
+        .unwrap();
+    owner
+        .accept_scoped(
+            &mut selections,
+            "synthetic-mat",
+            owner.generation(),
+            StateStore::default(),
+            Events::default(),
+        )
+        .unwrap();
+    owner.set_lifecycle(Status::Ready);
+    owner.set_lifecycle(Status::SubscriptionsIncomplete);
+    assert_eq!(
+        owner.presentation().subscription,
+        SubscriptionState::Incomplete
+    );
+    assert_eq!(owner.webhook(&event, 1001, 0, 0).status, 200);
+}

@@ -609,6 +609,23 @@ impl<S: Store, H: Sink> Coordinator<S, H> {
         Ok(())
     }
     pub fn set_lifecycle(&mut self, status: LifecycleStatus) {
+        if matches!(
+            status,
+            LifecycleStatus::AuthorizationRequired | LifecycleStatus::RefreshPersistenceFailed
+        ) {
+            self.adapter = None;
+            self.binding = None;
+            self.discovered = None;
+            self.lifecycle_ready = false;
+            self.generation = self.generation.wrapping_add(1);
+            self.recovery = AccountRecoveryStatus::ReconnectRequired;
+            self.setup = if self.account.is_some() {
+                SetupStatus::SelectionNeeded
+            } else {
+                SetupStatus::AccountRequired
+            };
+            return;
+        }
         self.lifecycle_ready = status == LifecycleStatus::Ready;
         self.setup = if self.adapter.is_some() && self.lifecycle_ready {
             SetupStatus::Configured
