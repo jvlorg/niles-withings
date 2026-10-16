@@ -109,6 +109,18 @@ impl<B: ScopedBackend, H: Sink> Owner<B, H> {
         self.coordinator
             .accept_scoped(p, id, generation, backend, sink)
     }
+    /// Begin choosing a replacement mat without changing durable credentials,
+    /// selection, or presence history. Delivery is revoked until acceptance.
+    pub fn switch_mat(&mut self) {
+        self.coordinator.switch_device();
+    }
+    /// Pause this in-memory owner. No provider unsubscribe or stored-secret
+    /// deletion is performed; callers may restore validated credentials later.
+    pub fn pause(&mut self) {
+        self.record = None;
+        self.lifecycle = Lifecycle::new(0, None, None);
+        self.coordinator.begin_account(None);
+    }
     #[allow(clippy::too_many_arguments)]
     pub fn reconcile<T: HttpTransport, R: SecureTokenStore, C: Clock>(
         &mut self,
@@ -120,7 +132,7 @@ impl<B: ScopedBackend, H: Sink> Owner<B, H> {
         callback: &CallbackUrl,
         comment: &str,
     ) -> LifecycleStatus {
-        let status = self
+        let mut status = self
             .lifecycle
             .reconcile_at(t, s, c, client_id, secret, callback, comment);
         self.coordinator.set_lifecycle(status.status);
@@ -128,12 +140,19 @@ impl<B: ScopedBackend, H: Sink> Owner<B, H> {
             status.status,
             lifecycle::Status::Ready | lifecycle::Status::SubscriptionsIncomplete
         ) {
-            if let Some(record) = self
+            self.record = self
                 .lifecycle
                 .credentials()
-                .and_then(|(t, m)| application::SecureAccountRecord::from_tokens(&t, m).ok())
-            {
-                self.record = Some(record);
+                .and_then(|(t, m)| application::SecureAccountRecord::from_tokens(&t, m).ok());
+            if self.record.is_none() {
+                status = LifecycleStatus {
+                    status: lifecycle::Status::AuthorizationRequired,
+                    reason: Some(lifecycle::BlockReason::UnknownOrInvalidMetadata),
+                    subscriptions: [false; 2],
+                };
+                self.lifecycle = Lifecycle::new(0, None, None);
+                self.coordinator
+                    .set_lifecycle(lifecycle::Status::AuthorizationRequired);
             }
         } else {
             self.record = None;

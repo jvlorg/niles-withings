@@ -690,6 +690,60 @@ fn callback_recovery_through_runtime_to_bed_event() {
     assert_eq!(c.webhook(&e, 1001, 0, 0).status, 200);
     assert_eq!(shared.0.borrow().actions, vec!["bed_in"]);
     assert_eq!(t.calls, 2);
+    let old_generation = c.generation();
+    c.switch_mat();
+    assert_eq!(c.webhook(&e, 1001, 0, 0).status, 503);
+    t.replies.push_back(devices(MAT));
+    c.discover(&mut t, &mut selections, 1001).unwrap();
+    assert!(
+        c.accept(
+            &mut selections,
+            "synthetic-mat",
+            old_generation,
+            shared.clone(),
+            shared.clone()
+        )
+        .is_err()
+    );
+    c.accept(
+        &mut selections,
+        "synthetic-mat",
+        c.generation(),
+        shared.clone(),
+        shared.clone(),
+    )
+    .unwrap();
+    let saved = secrets.0.clone();
+    let calls = t.calls;
+    c.pause();
+    assert_eq!(c.webhook(&e, 1001, 0, 0).status, 503);
+    assert!(c.discover(&mut t, &mut selections, 1001).is_err());
+    assert_eq!(t.calls, calls);
+    assert_eq!(secrets.0, saved);
+    c.restore(&mut secrets, 123, 1001).unwrap();
+    t.replies.push_back(devices(MAT));
+    c.discover(&mut t, &mut selections, 1001).unwrap();
+    c.activate(&mut selections, 123, shared.clone(), shared.clone())
+        .unwrap();
+    assert_eq!(c.webhook(&e, 1001, 0, 0).status, 200);
+    assert_eq!(shared.0.borrow().actions, vec!["bed_in"]);
+    // An invalid callback must revoke an already-active owner without HTTP.
+    let calls = t.calls;
+    assert!(
+        c.callback(
+            &mut t,
+            &mut secrets,
+            &CallbackUrl::parse("https://example.com/callback").unwrap(),
+            &[],
+            None,
+            "client",
+            &Secret::new("secret").unwrap(),
+            1001
+        )
+        .is_err()
+    );
+    assert_eq!(c.webhook(&e, 1001, 0, 0).status, 503);
+    assert_eq!(t.calls, calls);
 }
 #[test]
 fn runtime_restore_rotation_revocation_and_restart() {
@@ -834,6 +888,68 @@ fn runtime_restore_rotation_revocation_and_restart() {
     assert!(o.restore(&mut secrets, 123, 8000).is_err());
     assert_eq!(o.webhook(&event(50, 8000), 8000, 0, 0).status, 503);
     assert_eq!(shared.0.borrow().actions, vec!["bed_in", "bed_out"]);
+    for failure in ["denied", "invalid", "save", "read"] {
+        secrets.read_fail = false;
+        secrets.fail = usize::MAX;
+        secrets.raw = record(123).serialize().unwrap();
+        o.restore(&mut secrets, 123, 1001).unwrap();
+        h.replies.push_back(devices(MAT));
+        o.discover(&mut h, &mut selections, 1001).unwrap();
+        o.activate(&mut selections, 123, shared.clone(), shared.clone())
+            .unwrap();
+        if failure == "save" {
+            secrets.fail = secrets.writes + 1;
+        }
+        if failure == "read" {
+            secrets.read_fail = true;
+        }
+        if failure != "denied" {
+            h.replies.push_back(if failure == "invalid" {
+                HttpResponse {
+                    status: 200,
+                    body: b"invalid".to_vec(),
+                }
+            } else {
+                token()
+            });
+        }
+        let query = if failure == "denied" {
+            vec![("error".into(), "access_denied".into())]
+        } else {
+            vec![("code".into(), "synthetic".into())]
+        };
+        let _ = o.callback(
+            &mut h,
+            &mut secrets,
+            &url,
+            &query,
+            None,
+            "client",
+            &secret,
+            1001,
+        );
+        assert_eq!(
+            o.webhook(&event(50, 1001), 1001, 0, 0).status,
+            503,
+            "{failure}"
+        );
+        let calls = h.bearers.len();
+        assert!(o.discover(&mut h, &mut selections, 1001).is_err());
+        assert_eq!(
+            o.reconcile(
+                &mut h,
+                &mut secrets,
+                &FixedClock(1001),
+                "client",
+                &secret,
+                &url,
+                "owned"
+            )
+            .status,
+            Status::AuthorizationRequired
+        );
+        assert_eq!(h.bearers.len(), calls);
+    }
 }
 const MAT: &str =
     r#"{"deviceid":"synthetic-mat","type":"Sleep Monitor","model":"Aura Sensor","model_id":61}"#;
