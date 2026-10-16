@@ -8,7 +8,7 @@ use crate::{
     lifecycle::Status as LifecycleStatus,
     withings_client::HttpTransport,
 };
-use std::marker::PhantomData;
+use std::{fmt, marker::PhantomData};
 
 /// A host-provided key/value backend. The coordinator supplies the complete,
 /// versioned account/device key; implementations must not reinterpret it.
@@ -74,6 +74,106 @@ pub enum SetupStatus {
     Configured,
 }
 
+/// Host-neutral setup presentation derived from coordinator ownership.
+#[derive(Clone, PartialEq, Eq)]
+pub struct SetupView {
+    pub connection: ConnectionState,
+    pub discovery: DiscoveryState,
+    pub candidates: Vec<SetupCandidate>,
+    pub selected: Option<SetupCandidate>,
+    pub subscription: SubscriptionState,
+    pub occupancy: OccupancyState,
+    pub actions: Vec<SetupAction>,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConnectionState {
+    Disconnected,
+    Connected,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DiscoveryState {
+    NotStarted,
+    InterruptedRefresh,
+    NoEligibleMats,
+    Unavailable,
+    Candidate,
+    MultipleCandidates,
+    StaleSelection,
+    Selected,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SubscriptionState {
+    NotConfigured,
+    Incomplete,
+    Ready,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OccupancyState {
+    Unknown,
+}
+#[derive(Clone, PartialEq, Eq)]
+pub struct SetupCandidate {
+    pub label: String,
+    action_id: String,
+}
+impl SetupCandidate {
+    pub fn action_id(&self) -> &str {
+        &self.action_id
+    }
+}
+#[derive(Clone, PartialEq, Eq)]
+pub enum SetupAction {
+    Connect,
+    Reconnect,
+    RetryDiscovery,
+    AcceptCandidate { action_id: String, generation: u64 },
+    ChooseCandidate { action_id: String, generation: u64 },
+    SwitchMat,
+    RefreshDiscovery,
+}
+impl fmt::Debug for SetupCandidate {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SetupCandidate")
+            .field("label", &self.label)
+            .field("action_id", &"[REDACTED]")
+            .finish()
+    }
+}
+impl fmt::Debug for SetupAction {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::AcceptCandidate { generation, .. } => f
+                .debug_struct("AcceptCandidate")
+                .field("action_id", &"[REDACTED]")
+                .field("generation", generation)
+                .finish(),
+            Self::ChooseCandidate { generation, .. } => f
+                .debug_struct("ChooseCandidate")
+                .field("action_id", &"[REDACTED]")
+                .field("generation", generation)
+                .finish(),
+            Self::Connect => f.write_str("Connect"),
+            Self::Reconnect => f.write_str("Reconnect"),
+            Self::RetryDiscovery => f.write_str("RetryDiscovery"),
+            Self::SwitchMat => f.write_str("SwitchMat"),
+            Self::RefreshDiscovery => f.write_str("RefreshDiscovery"),
+        }
+    }
+}
+impl fmt::Debug for SetupView {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SetupView")
+            .field("connection", &self.connection)
+            .field("discovery", &self.discovery)
+            .field("candidates", &self.candidates)
+            .field("selected", &self.selected)
+            .field("subscription", &self.subscription)
+            .field("occupancy", &self.occupancy)
+            .field("actions", &self.actions)
+            .finish()
+    }
+}
+
 /// The current authenticated account, discovery generation, durable selection, and adapter form one ownership boundary.
 pub struct Coordinator<S: Store, H: Sink> {
     adapter: Option<Adapter<S, H>>,
@@ -84,6 +184,7 @@ pub struct Coordinator<S: Store, H: Sink> {
     setup: SetupStatus,
     lifecycle_ready: bool,
     choosing: bool,
+    discovery_failed: bool,
     marker: PhantomData<(S, H)>,
 }
 impl<S: Store, H: Sink> Default for Coordinator<S, H> {
@@ -97,6 +198,7 @@ impl<S: Store, H: Sink> Default for Coordinator<S, H> {
             setup: SetupStatus::AccountRequired,
             lifecycle_ready: false,
             choosing: false,
+            discovery_failed: false,
             marker: PhantomData,
         }
     }
@@ -156,6 +258,116 @@ impl<S: Store, H: Sink> Coordinator<S, H> {
     pub fn generation(&self) -> u64 {
         self.generation
     }
+    pub fn presentation(&self, pending_recovery: bool) -> SetupView {
+        use crate::application::SetupResolution;
+        let resolution = self
+            .discovered
+            .as_ref()
+            .filter(|(g, _)| *g == self.generation)
+            .map(|(_, r)| r);
+        let connection = if self.account.is_some() {
+            ConnectionState::Connected
+        } else {
+            ConnectionState::Disconnected
+        };
+        let mut candidates = Vec::new();
+        let mut selected = self
+            .binding
+            .as_ref()
+            .filter(|_| !pending_recovery)
+            .map(|binding| SetupCandidate {
+                label: "Selected mat".into(),
+                action_id: binding.identity().device_id,
+            });
+        let discovery = if pending_recovery {
+            DiscoveryState::InterruptedRefresh
+        } else {
+            match resolution {
+                None if selected.is_some() => DiscoveryState::Selected,
+                None => DiscoveryState::NotStarted,
+                Some(SetupResolution::Unavailable) => {
+                    if self.binding.is_some() {
+                        DiscoveryState::Selected
+                    } else {
+                        if self.discovery_failed {
+                            DiscoveryState::Unavailable
+                        } else {
+                            DiscoveryState::NoEligibleMats
+                        }
+                    }
+                }
+                Some(SetupResolution::Candidate { device, .. }) => {
+                    candidates.push(SetupCandidate {
+                        label: format!("{} {}", device.model, device.device_type),
+                        action_id: device.device_id.clone(),
+                    });
+                    DiscoveryState::Candidate
+                }
+                Some(SetupResolution::Choose { devices, .. }) => {
+                    candidates.extend(devices.iter().map(|device| SetupCandidate {
+                        label: format!("{} {}", device.model, device.device_type),
+                        action_id: device.device_id.clone(),
+                    }));
+                    DiscoveryState::MultipleCandidates
+                }
+                Some(SetupResolution::StaleSelection) => DiscoveryState::StaleSelection,
+                Some(SetupResolution::Selected(binding)) => {
+                    selected = Some(SetupCandidate {
+                        label: "Selected mat".into(),
+                        action_id: binding.identity().device_id,
+                    });
+                    DiscoveryState::Selected
+                }
+            }
+        };
+        let subscription = if pending_recovery || self.binding.is_none() {
+            SubscriptionState::NotConfigured
+        } else if self.lifecycle_ready {
+            SubscriptionState::Ready
+        } else {
+            SubscriptionState::Incomplete
+        };
+        let mut actions = Vec::new();
+        if pending_recovery {
+            actions.push(SetupAction::Reconnect);
+        } else if self.account.is_none() {
+            actions.push(SetupAction::Connect);
+        } else {
+            match discovery {
+                DiscoveryState::Unavailable | DiscoveryState::NoEligibleMats => {
+                    actions.push(SetupAction::RetryDiscovery)
+                }
+                DiscoveryState::Candidate => {
+                    if let Some(c) = candidates.first() {
+                        actions.push(SetupAction::AcceptCandidate {
+                            action_id: c.action_id.clone(),
+                            generation: self.generation,
+                        });
+                    }
+                }
+                DiscoveryState::MultipleCandidates => {
+                    actions.extend(candidates.iter().map(|c| SetupAction::ChooseCandidate {
+                        action_id: c.action_id.clone(),
+                        generation: self.generation,
+                    }))
+                }
+                DiscoveryState::StaleSelection => actions.push(SetupAction::SwitchMat),
+                DiscoveryState::Selected => {
+                    actions.extend([SetupAction::RefreshDiscovery, SetupAction::SwitchMat])
+                }
+                _ => actions.push(SetupAction::RetryDiscovery),
+            }
+        }
+        SetupView {
+            connection,
+            discovery,
+            candidates,
+            selected,
+            subscription,
+            occupancy: OccupancyState::Unknown,
+            actions,
+        }
+    }
     pub fn begin_account(&mut self, account: Option<u64>) {
         let account = account.filter(|id| *id != 0);
         if self.account == account {
@@ -195,6 +407,8 @@ impl<S: Store, H: Sink> Coordinator<S, H> {
         self.discovered = None;
         self.lifecycle_ready = false;
         self.generation = self.generation.wrapping_add(1);
+        self.discovery_failed = true;
+        self.discovered = Some((self.generation, application::SetupResolution::Unavailable));
         self.setup = if self.account.is_some() {
             SetupStatus::SelectionNeeded
         } else {
@@ -239,11 +453,13 @@ impl<S: Store, H: Sink> Coordinator<S, H> {
         ) {
             Ok(result) => result,
             Err(error) => {
-                self.discovered = None;
+                self.discovery_failed = true;
+                self.discovered = Some((self.generation, SetupResolution::Unavailable));
                 self.setup = SetupStatus::SelectionNeeded;
                 return Err(error);
             }
         };
+        self.discovery_failed = false;
         self.setup = match &result {
             SetupResolution::Unavailable
             | SetupResolution::Candidate { .. }

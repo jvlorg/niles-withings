@@ -259,6 +259,153 @@ fn coordinator_scopes_mat_switch_restart_and_failures() {
     assert_eq!(d.values[&key_b], preserved[&key_b]);
     assert_eq!(d.actions, vec!["bed_in", "bed_in", "bed_out", "bed_in"]);
 }
+#[test]
+fn coordinator_presentation_follows_owned_setup_states_and_redacts_actions() {
+    use niles_withings::coordinator::{
+        ConnectionState, Coordinator, DiscoveryState, OccupancyState, SetupAction,
+        SubscriptionState,
+    };
+    let mut owner =
+        Coordinator::<niles_withings::coordinator::ScopedStore<StateStore>, Events>::default();
+    assert_eq!(
+        owner.presentation(false).connection,
+        ConnectionState::Disconnected
+    );
+    assert_eq!(
+        owner.presentation(false).actions,
+        vec![SetupAction::Connect]
+    );
+    owner.begin_account(Some(123));
+    assert_eq!(
+        owner.presentation(true).discovery,
+        DiscoveryState::InterruptedRefresh
+    );
+    assert_eq!(
+        owner.presentation(true).actions,
+        vec![SetupAction::Reconnect]
+    );
+    let mut selections = Selections::default();
+    let mut transport = Transport {
+        replies: [
+            devices(MAT),
+            devices(MAT),
+            devices(MAT),
+            HttpResponse {
+                status: 503,
+                body: vec![],
+            },
+        ]
+        .into(),
+        calls: 0,
+    };
+    owner
+        .discover(&mut transport, &mut selections, &record(123), 1001)
+        .unwrap();
+    let view = owner.presentation(false);
+    assert_eq!(view.discovery, DiscoveryState::Candidate);
+    assert_eq!(view.occupancy, OccupancyState::Unknown);
+    assert!(!format!("{view:?}").contains("synthetic-mat"));
+    owner
+        .accept_scoped(
+            &mut selections,
+            "synthetic-mat",
+            owner.generation(),
+            StateStore::default(),
+            Events::default(),
+        )
+        .unwrap();
+    assert_eq!(
+        owner.presentation(false).subscription,
+        SubscriptionState::Incomplete
+    );
+    owner
+        .discover(&mut transport, &mut selections, &record(123), 1001)
+        .unwrap();
+    owner.set_lifecycle(niles_withings::lifecycle::Status::Ready);
+    let view = owner.presentation(false);
+    assert_eq!(view.discovery, DiscoveryState::Selected);
+    assert_eq!(view.subscription, SubscriptionState::Ready);
+    assert_eq!(view.occupancy, OccupancyState::Unknown);
+    owner.switch_device();
+    owner
+        .discover(&mut transport, &mut selections, &record(123), 1001)
+        .unwrap();
+    assert_eq!(
+        owner.presentation(false).discovery,
+        DiscoveryState::Candidate
+    );
+    owner
+        .discover(&mut transport, &mut selections, &record(123), 1001)
+        .unwrap_err();
+    assert_eq!(
+        owner.presentation(false).discovery,
+        DiscoveryState::Unavailable
+    );
+    assert_eq!(
+        owner.presentation(false).actions,
+        vec![SetupAction::RetryDiscovery]
+    );
+}
+
+#[test]
+fn presentation_multiple_empty_stale_and_pending() {
+    use niles_withings::coordinator::{
+        Coordinator, DiscoveryState, ScopedStore, SetupAction, SubscriptionState,
+    };
+    let mut owner = Coordinator::<ScopedStore<StateStore>, Events>::default();
+    owner.begin_account(Some(123));
+    let mut selections = Selections::default();
+    let rows = format!("{MAT},{}", MAT.replace("synthetic-mat", "matB"));
+    let mut t = Transport {
+        replies: [
+            devices(""),
+            devices(&rows),
+            devices(&MAT.replace("synthetic-mat", "matB")),
+        ]
+        .into(),
+        calls: 0,
+    };
+    owner
+        .discover(&mut t, &mut selections, &record(123), 1001)
+        .unwrap();
+    assert_eq!(
+        owner.presentation(false).discovery,
+        DiscoveryState::NoEligibleMats
+    );
+    owner
+        .discover(&mut t, &mut selections, &record(123), 1001)
+        .unwrap();
+    let v = owner.presentation(false);
+    assert_eq!(v.discovery, DiscoveryState::MultipleCandidates);
+    assert_eq!(v.candidates.len(), 2);
+    assert_eq!(v.actions.len(), 2);
+    assert!(v.actions.iter().all(|a| matches!(a,SetupAction::ChooseCandidate{generation,..} if *generation==owner.generation())));
+    owner
+        .accept_scoped(
+            &mut selections,
+            "synthetic-mat",
+            owner.generation(),
+            StateStore::default(),
+            Events::default(),
+        )
+        .unwrap();
+    let v = owner.presentation(false);
+    assert_eq!(v.discovery, DiscoveryState::Selected);
+    assert!(v.selected.is_some());
+    owner.set_lifecycle(niles_withings::lifecycle::Status::Ready);
+    assert_ne!(
+        owner.presentation(true).subscription,
+        SubscriptionState::Ready
+    );
+    assert!(owner.presentation(true).selected.is_none());
+    owner
+        .discover(&mut t, &mut selections, &record(123), 1001)
+        .unwrap();
+    let v = owner.presentation(false);
+    assert_eq!(v.discovery, DiscoveryState::StaleSelection);
+    assert!(v.selected.is_none());
+    assert_eq!(v.actions, vec![SetupAction::SwitchMat]);
+}
 const MAT: &str =
     r#"{"deviceid":"synthetic-mat","type":"Sleep Monitor","model":"Aura Sensor","model_id":61}"#;
 
