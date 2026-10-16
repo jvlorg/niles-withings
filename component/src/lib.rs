@@ -247,11 +247,14 @@ fn activate_saved() -> Result<(), String> {
         owner
             .restore(&mut store, account, now()?)
             .map_err(|_| "Account restore failed".to_string())?;
-        reconcile_owner(&mut owner)?;
+        // Refresh expired credentials first. A transient subscription failure
+        // may leave valid credentials; discovery itself enforces that boundary.
+        let _ = reconcile_owner(&mut owner);
         let mut transport = HostTransport;
-        owner
-            .discover(&mut transport, &mut store, now()?)
-            .map_err(|_| "Device discovery failed".to_string())?;
+        if owner.discover(&mut transport, &mut store, now()?).is_err() {
+            owner.discovery_failed();
+            return Err("Device discovery failed".into());
+        }
         // Honor a legacy explicit device_id only when it exactly matches
         // current, account-validated discovery. Never infer a replacement.
         let mut accepted_configured = false;
@@ -286,6 +289,7 @@ fn activate_saved() -> Result<(), String> {
                 .activate(&mut store, account, HostStore, sink)
                 .map_err(|_| "Saved selection activation failed".to_string())?;
         }
+        // Subscription failure is recoverable; do not block discovery/setup.
         reconcile_owner(&mut owner)?;
         Ok(())
     })();
@@ -518,6 +522,7 @@ impl Guest for Plugin {
                     owner.switch_mat();
                     let mut store = HostStore;
                     let mut transport = HostTransport;
+                    let _ = reconcile_owner(&mut owner);
                     match owner.discover(&mut transport, &mut store, now()?) {
                         Ok(_) => Ok("Sleep mat discovery refreshed".to_string()),
                         Err(_) => {

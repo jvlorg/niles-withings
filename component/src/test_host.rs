@@ -21,6 +21,7 @@ struct Ledger {
     legacy_id: bool,
     configured_user: Option<String>,
     second_account: bool,
+    subscription_error: bool,
 }
 thread_local! { static LEDGER: RefCell<Ledger> = RefCell::new(Ledger::default()); }
 pub fn clock() -> Result<i64, String> {
@@ -134,6 +135,9 @@ pub mod http {
         let response = if body.contains("grant_type=") {
             r#"{"status":0,"body":{"userid":123,"access_token":"fixture-access","refresh_token":"fixture-refresh","expires_in":3600,"client_id":"fixture-client"}}"#.to_string()
         } else if body.starts_with("action=list") {
+            if LEDGER.with(|l| l.borrow().subscription_error) {
+                return Err(());
+            }
             assert!(
                 r.headers
                     .iter()
@@ -616,6 +620,41 @@ fn replacement_account_does_not_inherit_mat_or_old_events() {
     Plugin::stop();
     Plugin::init().unwrap();
     assert_eq!(Plugin::on_webhook(event(50)).status, 503);
+}
+#[test]
+fn subscription_failure_recovers_on_timer_without_reconnecting() {
+    reset();
+    Plugin::init().unwrap();
+    LEDGER.with(|l| l.borrow_mut().subscription_error = true);
+    assert!(connect().is_err());
+    assert_eq!(Plugin::on_webhook(event(50)).status, 503);
+    LEDGER.with(|l| l.borrow_mut().subscription_error = false);
+    Plugin::on_timer("lifecycle".into());
+    choose_rendered(0);
+    assert_eq!(Plugin::on_webhook(event(50)).status, 200);
+    assert!(panel().contains("subscriptions ready"));
+}
+#[test]
+fn replacement_account_explicit_retry_selects_without_old_event_delivery() {
+    reset();
+    Plugin::init().unwrap();
+    connect().unwrap();
+    choose_rendered(0);
+    LEDGER.with(|l| l.borrow_mut().second_account = true);
+    let _ = connect();
+    // The new account offers its own rendered choice, never the saved binding.
+    assert!(OWNER.with(|o| o.borrow().presentation().selected.is_none()));
+    choose_rendered(0);
+    assert_ne!(Plugin::on_webhook(event(50)).status, 200);
+    let mut current = event(50);
+    current.body = String::from_utf8(current.body)
+        .unwrap()
+        .replace("userid=123", "userid=456")
+        .into_bytes();
+    assert_eq!(Plugin::on_webhook(current).status, 200);
+    Plugin::stop();
+    Plugin::init().unwrap();
+    assert_ne!(Plugin::on_webhook(event(50)).status, 200);
 }
 fn panel() -> String {
     let tree = Plugin::render(
