@@ -22,6 +22,9 @@ Presence is Unknown/InBed/OutOfBed; startup restores state without action, first
 
 Main provider acceptance: 44 tests passed (11 provider unit, 8 adapter, 18 core contracts, 2 original review, 5 provider review), strict Clippy, formatting, fresh file-backed replay and real local Niles 0.2.1 checker/dev-host initialization. Verified using the existing CLI at `/home/jleth/projects/niles/target/release/niles`. Both categories 50/51 are handled; ambiguous cleanup ownership fails closed; secret-bearing Debug output is redacted. Live completion is gated on an agreed host inbound callback/OAuth-return interface and encrypted mutable token storage, followed by component wiring and separately authorized physical testing.
 
+## Test environment checkpoint
+A separate PC-side test Niles is running on 10.42.20.209, Compose project `test-niles`, with fresh database/encryption material, an empty isolated broker and no Internet/household connectivity. Private loopback UI: `http://127.0.0.1:18081` on that host. Deployment and resume instructions: `/home/jleth/services/test-niles/README.md`. Health/UI HTTP checks passed; add-on installation in this server, browser walkthrough and Withings login are still pending. Retired installation and project-server production remain untouched. Await Mark's response before selecting a host extension approach.
+
 ## Commands
 `cargo fmt --all -- --check`
 `cargo clippy --workspace --all-targets -- -D warnings`
