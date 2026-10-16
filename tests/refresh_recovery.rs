@@ -1,8 +1,11 @@
 use niles_withings::{
-    application::{AccountSecretStore, ApplicationError, SecureAccountRecord},
+    application::{
+        AccountSecretStore, ApplicationError, CallbackResult, SecureAccountRecord, on_callback,
+    },
     lifecycle::{Lifecycle, SecureTokenStore, Status, TokenMetadata},
     withings_client::{CallbackUrl, HttpRequest, HttpResponse, HttpTransport, Secret, TokenSet},
 };
+
 #[derive(Default)]
 struct Disk {
     bytes: String,
@@ -11,27 +14,36 @@ struct Disk {
 }
 impl AccountSecretStore for Disk {
     type Error = ();
-    fn set_account_record(&mut self, s: &str) -> Result<(), ()> {
+    fn set_account_record(&mut self, value: &str) -> Result<(), ()> {
         self.writes += 1;
         if self.writes == self.fail_at {
             return Err(());
         }
-        self.bytes = s.into();
+        self.bytes = value.into();
         Ok(())
     }
 }
 struct Provider {
     calls: usize,
     user: u64,
+    transport_failure: bool,
 }
 impl HttpTransport for Provider {
     type Error = ();
     fn post(&mut self, _: HttpRequest) -> Result<HttpResponse, ()> {
         self.calls += 1;
-        if self.calls > 1 {
+        if self.transport_failure {
             return Err(());
         }
-        Ok(HttpResponse{status:200,body:format!(r#"{{"status":0,"body":{{"userid":{},"access_token":"new-access","refresh_token":"new-refresh","expires_in":3600,"scope":"user.sleepevents","token_type":"Bearer"}}}}"#,self.user).into_bytes()})
+        let (access, refresh) = if self.calls == 1 {
+            ("new-access", "new-refresh")
+        } else {
+            ("access", "")
+        };
+        if refresh.is_empty() {
+            return Err(());
+        }
+        Ok(HttpResponse { status: 200, body: format!(r#"{{"status":0,"body":{{"userid":{},"access_token":"{}","refresh_token":"{}","expires_in":3600,"scope":"user.sleepevents","token_type":"Bearer"}}}}"#, self.user, access, refresh).into_bytes() })
     }
 }
 fn tokens() -> TokenSet {
@@ -48,6 +60,18 @@ fn metadata() -> TokenMetadata {
         expires_at: 4600,
     }
 }
+fn callback(d: &mut Disk, p: &mut Provider) -> Result<CallbackResult, ApplicationError> {
+    on_callback(
+        p,
+        d,
+        &CallbackUrl::parse("https://example.com/callback").unwrap(),
+        &[("code".into(), "synthetic-code".into())],
+        None,
+        "client",
+        &Secret::new("secret").unwrap(),
+        4500,
+    )
+}
 fn run(l: &mut Lifecycle, d: &mut Disk, p: &mut Provider) -> Status {
     l.reconcile(
         p,
@@ -60,6 +84,12 @@ fn run(l: &mut Lifecycle, d: &mut Disk, p: &mut Provider) -> Status {
     )
     .status
 }
+fn pending(d: &mut Disk) {
+    d.replace_tokens_and_metadata(&tokens(), metadata())
+        .unwrap();
+    d.begin_refresh(&tokens(), metadata()).unwrap();
+}
+
 #[test]
 fn pending_restart_and_clean_replacement() {
     let mut d = Disk::default();
@@ -87,6 +117,7 @@ fn rotated_but_unsaved_is_blocked_after_restart() {
     let mut p = Provider {
         calls: 0,
         user: 123,
+        transport_failure: false,
     };
     assert_eq!(
         run(&mut l, &mut d, &mut p),
@@ -110,6 +141,7 @@ fn intent_failure_sends_nothing() {
     let mut p = Provider {
         calls: 0,
         user: 123,
+        transport_failure: false,
     };
     assert_eq!(
         run(&mut l, &mut d, &mut p),
@@ -125,6 +157,7 @@ fn completed_refresh_restores_new_pair() {
     let mut p = Provider {
         calls: 0,
         user: 123,
+        transport_failure: false,
     };
     assert_eq!(run(&mut l, &mut d, &mut p), Status::SubscriptionsIncomplete);
     let (t, m) = SecureAccountRecord::restore(&d.bytes, 123, 4500).unwrap();
@@ -138,6 +171,7 @@ fn foreign_response_keeps_pending_and_blocks_retry() {
     let mut p = Provider {
         calls: 0,
         user: 999,
+        transport_failure: false,
     };
     assert_eq!(run(&mut l, &mut d, &mut p), Status::AuthorizationRequired);
     assert_eq!(run(&mut l, &mut d, &mut p), Status::AuthorizationRequired);
@@ -147,4 +181,114 @@ fn foreign_response_keeps_pending_and_blocks_retry() {
         ApplicationError::RecoveryRequired
     );
     assert!(!d.bytes.contains("new-refresh"));
+}
+#[test]
+fn restart_pending_then_actual_callback_replaces_and_reconciles() {
+    let mut disk = Disk::default();
+    pending(&mut disk);
+    assert_eq!(
+        SecureAccountRecord::restore(&disk.bytes, 123, 4500).unwrap_err(),
+        ApplicationError::RecoveryRequired
+    );
+    let mut callback_provider = Provider {
+        calls: 0,
+        user: 123,
+        transport_failure: false,
+    };
+    assert_eq!(
+        callback(&mut disk, &mut callback_provider),
+        Ok(CallbackResult::Stored { user_id: 123 })
+    );
+    let (restored, restored_meta) = SecureAccountRecord::restore(&disk.bytes, 123, 4500).unwrap();
+    assert_eq!(restored.access_token.expose_secret(), "new-access");
+    let mut lifecycle = Lifecycle::new(123, Some(restored), Some(restored_meta));
+    struct Subscriptions;
+    impl HttpTransport for Subscriptions {
+        type Error = ();
+        fn post(&mut self, _: HttpRequest) -> Result<HttpResponse, ()> {
+            Ok(HttpResponse { status: 200, body: br#"{"status":0,"body":{"profiles":[{"appli":50,"callbackurl":"https://example.com/hook","comment":"owned"},{"appli":51,"callbackurl":"https://example.com/hook","comment":"owned"}]}}"#.to_vec() })
+        }
+    }
+    assert_eq!(
+        lifecycle
+            .reconcile(
+                &mut Subscriptions,
+                &mut disk,
+                "client",
+                &Secret::new("secret").unwrap(),
+                &CallbackUrl::parse("https://example.com/hook").unwrap(),
+                "owned",
+                4500
+            )
+            .status,
+        Status::Ready
+    );
+    assert!(SecureAccountRecord::restore(&disk.bytes, 123, 4500).is_ok());
+}
+
+#[test]
+fn failed_callback_persistence_preserves_pending_record_and_refuses_restore() {
+    let mut disk = Disk::default();
+    pending(&mut disk);
+    let before = disk.bytes.clone();
+    disk.fail_at = disk.writes + 1;
+    let mut p = Provider {
+        calls: 0,
+        user: 123,
+        transport_failure: false,
+    };
+    assert_eq!(callback(&mut disk, &mut p), Err(ApplicationError::Storage));
+    assert_eq!(disk.bytes, before);
+    assert_eq!(
+        SecureAccountRecord::restore(&disk.bytes, 123, 4500).unwrap_err(),
+        ApplicationError::RecoveryRequired
+    );
+}
+
+#[test]
+fn ambiguous_transport_failure_latches_runtime_and_persisted_restore() {
+    let mut disk = Disk::default();
+    let mut lifecycle = Lifecycle::new(123, Some(tokens()), Some(metadata()));
+    let mut p = Provider {
+        calls: 0,
+        user: 123,
+        transport_failure: true,
+    };
+    let first = run(&mut lifecycle, &mut disk, &mut p);
+    assert_eq!(first, Status::AuthorizationRequired);
+    assert_eq!(run(&mut lifecycle, &mut disk, &mut p), first);
+    assert_eq!(p.calls, 1);
+    assert_eq!(
+        SecureAccountRecord::restore(&disk.bytes, 123, 4500).unwrap_err(),
+        ApplicationError::RecoveryRequired
+    );
+    let restarted_store = Disk {
+        bytes: disk.bytes.clone(),
+        ..Disk::default()
+    };
+    assert_eq!(
+        SecureAccountRecord::restore(&restarted_store.bytes, 123, 4500).unwrap_err(),
+        ApplicationError::RecoveryRequired
+    );
+    // Restore refused to supply tokens: no lifecycle may be rebuilt from this record.
+}
+
+#[test]
+fn malformed_unknown_version_oversized_pending_and_debug_are_fail_closed() {
+    let mut disk = Disk::default();
+    pending(&mut disk);
+    assert!(SecureAccountRecord::restore("not json", 123, 4500).is_err());
+    let mut unknown: serde_json::Value = serde_json::from_str(&disk.bytes).unwrap();
+    unknown["version"] = serde_json::json!(9);
+    assert!(SecureAccountRecord::restore(&unknown.to_string(), 123, 4500).is_err());
+    assert_eq!(
+        SecureAccountRecord::restore(&"x".repeat(4097), 123, 4500),
+        Err(ApplicationError::InvalidRecord)
+    );
+    let debug = format!("{:?}", SecureAccountRecord::restore(&disk.bytes, 123, 4500));
+    assert!(!debug.contains("old-access") && !debug.contains("old-refresh"));
+    disk.replace_tokens_and_metadata(&tokens(), metadata())
+        .unwrap();
+    let legacy = disk.bytes.replace(",\"refresh_pending\":false", "");
+    assert!(SecureAccountRecord::restore(&legacy, 123, 4500).is_ok());
 }
