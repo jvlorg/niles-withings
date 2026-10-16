@@ -153,6 +153,11 @@ pub mod provider {
         o
     }
 }
+
+/// Offline-testable OAuth and notification API contracts. This module is not
+/// wired into the Niles component: the pinned host has no secret-store API.
+pub mod withings_client;
+
 pub mod presence {
     use crate::{
         config::Identity,
