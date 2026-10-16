@@ -1,6 +1,8 @@
 use niles_withings::{
-    adapter::{Adapter, DeliveryError, Reading, Sink, Store},
+    adapter::{Adapter, DeliveryError, Reading, Sink, Store, host_action, map_state},
     config::Identity,
+    presence::State,
+    presentation::{Connection, Model},
 };
 use std::{cell::RefCell, rc::Rc};
 #[derive(Clone, Default)]
@@ -64,7 +66,7 @@ fn persists_before_actions_and_duplicate_restart_is_silent() {
         &[
             "save",
             "reading:Occupied { occupied: true, observed_at: 1000 }",
-            "action:bed_in"
+            "action:in_bed"
         ]
     );
     let mut b = Adapter::new(id(), shared.clone(), shared.clone()).unwrap();
@@ -75,7 +77,7 @@ fn persists_before_actions_and_duplicate_restart_is_silent() {
             .borrow()
             .calls
             .iter()
-            .filter(|x| x.as_str() == "action:bed_in")
+            .filter(|x| x.as_str() == "action:in_bed")
             .count(),
         1
     );
@@ -100,12 +102,12 @@ fn action_sink_failure_is_reported_as_ambiguous_after_commit() {
     assert!(matches!(
         a.deliver(event(50, 1000).as_bytes(), 1000, 100, 0),
         Err(DeliveryError::ActionSink {
-            action: "bed_in",
+            action: "in_bed",
             ..
         })
     ));
     assert!(shared.0.borrow().state.is_some());
-    assert!(shared.0.borrow().calls.iter().any(|x| x == "action:bed_in"));
+    assert!(shared.0.borrow().calls.iter().any(|x| x == "action:in_bed"));
 }
 #[test]
 fn malformed_input_has_no_side_effects() {
@@ -169,6 +171,69 @@ fn restored_conflicting_event_publishes_unknown_without_an_action() {
             .calls
             .iter()
             .any(|x| x.starts_with("action:"))
+    );
+}
+
+#[test]
+fn event_to_host_boundary_maps_direction_and_status_truthfully() {
+    assert_eq!(host_action("bed_in"), Some("in_bed"));
+    assert_eq!(host_action("bed_out"), Some("out_of_bed"));
+    assert_eq!(host_action("unknown"), None);
+    let mut state = State::new(id());
+    assert_eq!(
+        map_state(&state, None).reading,
+        Reading::Unknown {
+            last_observation: None
+        }
+    );
+    assert_eq!(
+        Model::from_state(&state, Connection::Connected).lines(),
+        [
+            "Connection: connected",
+            "Occupancy: unknown",
+            "Last event: none"
+        ]
+    );
+    assert_eq!(
+        Model::from_state(&state, Connection::Disconnected).lines(),
+        [
+            "Connection: disconnected",
+            "Occupancy: unavailable while disconnected"
+        ]
+    );
+    let e = niles_withings::provider::parse(event(50, 1000).as_bytes(), &id(), 1000, 0, 0).unwrap();
+    assert_eq!(state.apply(&e).action, Some("bed_in"));
+    let mapped = map_state(&state, Some("bed_in"));
+    assert_eq!(
+        mapped.reading,
+        Reading::Occupied {
+            occupied: true,
+            observed_at: 1000
+        }
+    );
+    assert_eq!(mapped.action, Some("in_bed"));
+    assert_eq!(
+        Model::from_state(&state, Connection::Connected).lines(),
+        [
+            "Connection: connected",
+            "Occupancy: in bed",
+            "Last event: 1000"
+        ]
+    );
+    let restored = State::restore(&state.persist()).unwrap();
+    assert_eq!(
+        Model::from_state(&restored, Connection::Connected).lines(),
+        [
+            "Connection: connected",
+            "Occupancy: in bed (unconfirmed)",
+            "Last event: 1000"
+        ]
+    );
+    assert_eq!(
+        map_state(&restored, None).reading,
+        Reading::Unknown {
+            last_observation: Some(1000)
+        }
     );
 }
 

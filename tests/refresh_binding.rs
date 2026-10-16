@@ -30,7 +30,7 @@ fn foreign_user_never_reaches_store() {
             &Secret::new("refresh").unwrap(),
             43
         ),
-        Err(ClientError::ProviderStatus)
+        Err(ClientError::AccountMismatch)
     );
     assert_eq!(s.calls, 0);
 }

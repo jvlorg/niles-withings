@@ -80,7 +80,29 @@ impl Guest for Plugin {
     fn on_timer(_: String) {}
     fn on_event(_: Event) {}
     fn render(_: String, _: RenderContext) -> Result<UiTree, String> {
-        Ok(UiTree { nodes: vec![Node { kind: NodeKind::Stack, children: vec![1, 2] }, Node { kind: NodeKind::Heading("Withings Sleep".into()), children: vec![] }, Node { kind: NodeKind::Text(TextBlock { value: "Setup values are supplied by the Niles host. Disconnected: this Niles interface has no inbound callback delivery, so occupancy and bed actions are not yet available.".into(), muted: false }), children: vec![] }] })
+        let lines = [
+            "Connection: disconnected",
+            "Occupancy: unavailable while disconnected",
+            "Last event: none",
+        ];
+        let mut nodes = vec![
+            Node {
+                kind: NodeKind::Stack,
+                children: vec![1],
+            },
+            Node {
+                kind: NodeKind::Card(Some("Withings Sleep".into())),
+                children: (2..=4).collect(),
+            },
+        ];
+        nodes.extend(lines.iter().map(|line| Node {
+            kind: NodeKind::Text(TextBlock {
+                value: (*line).into(),
+                muted: false,
+            }),
+            children: vec![],
+        }));
+        Ok(UiTree { nodes })
     }
     fn on_action(
         _: String,

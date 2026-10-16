@@ -108,6 +108,7 @@ pub struct Lifecycle {
     tokens: Option<TokenSet>,
     metadata: Option<TokenMetadata>,
     unusable: Option<BlockReason>,
+    last_verified: Option<([bool; 2], TokenMetadata)>,
 }
 impl Lifecycle {
     /// Missing or invalid persisted metadata fails closed on restart.
@@ -121,6 +122,7 @@ impl Lifecycle {
             tokens,
             metadata,
             unusable: None,
+            last_verified: None,
         }
     }
     #[allow(clippy::too_many_arguments)]
@@ -144,7 +146,9 @@ impl Lifecycle {
             clock.now(),
         )
     }
-    pub fn status(&self) -> LifecycleStatus {
+    /// Current status requires a caller-supplied timestamp; last reconciliation
+    /// is only reported Ready while both verified subscription state and tokens remain valid.
+    pub fn status(&self, now: i64) -> LifecycleStatus {
         let reason = self.unusable.or_else(|| {
             if self.expected_user == 0 || self.tokens.is_none() {
                 Some(BlockReason::MissingTokens)
@@ -165,13 +169,25 @@ impl Lifecycle {
         });
         let status = if reason == Some(BlockReason::StorageFailed) {
             Status::RefreshPersistenceFailed
+        } else if reason.is_none()
+            && self.last_verified.is_some_and(|(subscriptions, metadata)| {
+                metadata.valid_at(now) && subscriptions == [true, true]
+            })
+        {
+            Status::Ready
+        } else if reason.is_none() {
+            Status::SubscriptionsIncomplete
         } else {
             Status::AuthorizationRequired
         };
         LifecycleStatus {
             status,
-            reason,
-            subscriptions: [false; 2],
+            reason: if status == Status::Ready {
+                None
+            } else {
+                reason.or(Some(BlockReason::ReadbackIncomplete))
+            },
+            subscriptions: self.last_verified.map_or([false; 2], |x| x.0),
         }
     }
     #[allow(clippy::too_many_arguments)]
@@ -185,6 +201,8 @@ impl Lifecycle {
         comment: &str,
         now: i64,
     ) -> LifecycleStatus {
+        // A failed reconciliation must not retain an earlier Ready snapshot.
+        self.last_verified = None;
         if let Some(reason) = self.unusable {
             return self.report(
                 if reason == BlockReason::StorageFailed {
@@ -229,7 +247,12 @@ impl Lifecycle {
                 [false; 2],
             );
         };
-        if !metadata.valid_at(now) {
+        let access_expired = metadata.expires_at <= now
+            && metadata.acquired_at > 0
+            && metadata.expires_at > metadata.acquired_at
+            && metadata.expires_at - metadata.acquired_at <= MAX_TOKEN_LIFETIME as i64
+            && now >= metadata.acquired_at;
+        if !metadata.valid_at(now) && !access_expired {
             return self.report(
                 Status::AuthorizationRequired,
                 Some(BlockReason::Expired),
@@ -254,7 +277,7 @@ impl Lifecycle {
                         [false; 2],
                     );
                 }
-                Err(ClientError::ProviderStatus) => {
+                Err(ClientError::AccountMismatch) => {
                     self.unusable = Some(BlockReason::AccountMismatch);
                     return self.report(Status::AuthorizationRequired, self.unusable, [false; 2]);
                 }
@@ -347,6 +370,7 @@ impl Lifecycle {
                 verified,
             );
         }
+        self.last_verified = Some((verified, self.metadata.unwrap_or(metadata)));
         self.report(Status::Ready, None, verified)
     }
     fn report(
@@ -478,8 +502,17 @@ mod tests {
             reconcile(&mut l, &mut t, &mut s, 1001).status,
             Status::Ready
         );
+        assert_eq!(l.status(1001).status, Status::Ready);
+        assert_eq!(l.status(1001).reason, None);
+        assert_eq!(l.status(10000).status, Status::SubscriptionsIncomplete);
+        assert_eq!(l.status(0).status, Status::SubscriptionsIncomplete);
         assert_eq!(t.requests.len(), 4);
         assert_eq!(s.writes, 0);
+        assert_ne!(
+            reconcile(&mut l, &mut t, &mut s, 1002).status,
+            Status::Ready
+        );
+        assert_ne!(l.status(1002).status, Status::Ready);
     }
     #[test]
     fn expired_and_unknown_restart_metadata_fail_closed() {
@@ -491,6 +524,43 @@ mod tests {
             );
             assert!(t.requests.is_empty());
         }
+    }
+    #[test]
+    fn expired_access_refreshes_before_any_subscription_request() {
+        let mut l = Lifecycle::new(
+            123,
+            Some(token()),
+            Some(TokenMetadata {
+                acquired_at: 500,
+                expires_at: 1000,
+            }),
+        );
+        let mut t = Mock::default();
+        t.responses.push_back(r(r#"{"status":0,"body":{"userid":123,"access_token":"fresh-access","refresh_token":"fresh-refresh","expires_in":9000}}"#));
+        push_lists(
+            &mut t,
+            r#"[{"appli":50,"callbackurl":"https://example.org/cb","comment":"niles-owned"}]"#,
+            r#"[{"appli":51,"callbackurl":"https://example.org/cb","comment":"niles-owned"}]"#,
+        );
+        push_lists(
+            &mut t,
+            r#"[{"appli":50,"callbackurl":"https://example.org/cb","comment":"niles-owned"}]"#,
+            r#"[{"appli":51,"callbackurl":"https://example.org/cb","comment":"niles-owned"}]"#,
+        );
+        push_lists(
+            &mut t,
+            r#"[{"appli":50,"callbackurl":"https://example.org/cb","comment":"niles-owned"}]"#,
+            r#"[{"appli":51,"callbackurl":"https://example.org/cb","comment":"niles-owned"}]"#,
+        );
+        assert_eq!(
+            reconcile(&mut l, &mut t, &mut Store::default(), 1100).status,
+            Status::Ready
+        );
+        assert!(t.requests[0].form.contains("grant_type=refresh_token"));
+        assert_eq!(
+            t.requests[1].bearer.as_ref().unwrap().expose_secret(),
+            "fresh-access"
+        );
     }
     #[test]
     fn refresh_user_mismatch_never_stores_and_rotation_failure_latches() {

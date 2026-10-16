@@ -313,6 +313,72 @@ pub mod presence {
     }
 }
 
+/// Safe host-neutral presentation model. Connection and occupancy are independent.
+pub mod presentation {
+    use crate::presence::{Health, Presence, State};
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum Connection {
+        Connected,
+        Disconnected,
+    }
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum Occupancy {
+        Unknown,
+        InBed,
+        OutOfBed,
+    }
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub struct Model {
+        pub connection: Connection,
+        pub occupancy: Occupancy,
+        pub confirmed: bool,
+        pub last_event_at: Option<i64>,
+    }
+    impl Model {
+        pub fn from_state(s: &State, connection: Connection) -> Self {
+            let occupancy = match s.presence {
+                Presence::Unknown => Occupancy::Unknown,
+                Presence::InBed => Occupancy::InBed,
+                Presence::OutOfBed => Occupancy::OutOfBed,
+            };
+            Self {
+                connection,
+                occupancy,
+                confirmed: s.health == Health::Confirmed,
+                last_event_at: s.last_observation,
+            }
+        }
+        pub fn lines(&self) -> Vec<String> {
+            let mut v = vec![
+                match self.connection {
+                    Connection::Connected => "Connection: connected",
+                    Connection::Disconnected => "Connection: disconnected",
+                }
+                .to_string(),
+            ];
+            if self.connection == Connection::Disconnected {
+                v.push("Occupancy: unavailable while disconnected".into());
+            } else {
+                v.push(
+                    match (self.occupancy, self.confirmed) {
+                        (Occupancy::Unknown, _) => "Occupancy: unknown",
+                        (Occupancy::InBed, true) => "Occupancy: in bed",
+                        (Occupancy::OutOfBed, true) => "Occupancy: out of bed",
+                        (Occupancy::InBed, false) => "Occupancy: in bed (unconfirmed)",
+                        (Occupancy::OutOfBed, false) => "Occupancy: out of bed (unconfirmed)",
+                    }
+                    .into(),
+                );
+                v.push(
+                    self.last_event_at
+                        .map_or_else(|| "Last event: none".into(), |t| format!("Last event: {t}")),
+                );
+            }
+            v
+        }
+    }
+}
+
 /// Host-neutral persistence-before-publication delivery adapter.
 pub mod adapter {
     use crate::{
@@ -332,10 +398,41 @@ pub mod adapter {
         fn publish_reading(&mut self, reading: Reading) -> Result<(), Self::Error>;
         fn publish_action(&mut self, action: &'static str) -> Result<(), Self::Error>;
     }
+    pub fn host_action(action: &'static str) -> Option<&'static str> {
+        match action {
+            "bed_in" => Some("in_bed"),
+            "bed_out" => Some("out_of_bed"),
+            _ => None,
+        }
+    }
     #[derive(Clone, Debug, PartialEq, Eq)]
     pub enum Reading {
         Unknown { last_observation: Option<i64> },
         Occupied { occupied: bool, observed_at: i64 },
+    }
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub struct MappedEvent {
+        pub reading: Reading,
+        pub action: Option<&'static str>,
+    }
+    pub fn map_state(state: &State, action: Option<&'static str>) -> MappedEvent {
+        let reading = match (state.presence, state.health) {
+            (Presence::InBed, Health::Confirmed) => Reading::Occupied {
+                occupied: true,
+                observed_at: state.last_observation.expect("known timestamp"),
+            },
+            (Presence::OutOfBed, Health::Confirmed) => Reading::Occupied {
+                occupied: false,
+                observed_at: state.last_observation.expect("known timestamp"),
+            },
+            _ => Reading::Unknown {
+                last_observation: state.last_observation,
+            },
+        };
+        MappedEvent {
+            reading,
+            action: action.and_then(host_action),
+        }
     }
     #[derive(Debug, PartialEq, Eq)]
     pub enum DeliveryError {
@@ -398,29 +495,11 @@ pub mod adapter {
                     .map_err(|_| DeliveryError::Storage)?;
                 self.state = candidate;
             }
-            let reading = match (self.state.presence, self.state.health) {
-                (Presence::InBed, Health::Confirmed) => Reading::Occupied {
-                    occupied: true,
-                    observed_at: self
-                        .state
-                        .last_observation
-                        .expect("known presence timestamp"),
-                },
-                (Presence::OutOfBed, Health::Confirmed) => Reading::Occupied {
-                    occupied: false,
-                    observed_at: self
-                        .state
-                        .last_observation
-                        .expect("known presence timestamp"),
-                },
-                _ => Reading::Unknown {
-                    last_observation: self.state.last_observation,
-                },
-            };
+            let mapped = map_state(&self.state, outcome.action);
             self.sink
-                .publish_reading(reading)
+                .publish_reading(mapped.reading)
                 .map_err(|_| DeliveryError::ReadingSink)?;
-            if let Some(action) = outcome.action {
+            if let Some(action) = mapped.action {
                 self.sink
                     .publish_action(action)
                     .map_err(|_| DeliveryError::ActionSink { action })?;

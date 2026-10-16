@@ -43,6 +43,7 @@ pub enum ClientError {
     Transport,
     HttpStatus,
     ProviderStatus,
+    AccountMismatch,
     MalformedResponse,
     MissingField,
     Storage,
@@ -278,7 +279,7 @@ pub fn refresh_bound<T: HttpTransport, S: SecretStore>(
     };
     let result = refresh(t, &mut bound, client_id, client_secret, refresh_token);
     if bound.mismatch {
-        Err(ClientError::ProviderStatus)
+        Err(ClientError::AccountMismatch)
     } else {
         result
     }
