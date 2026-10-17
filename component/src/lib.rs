@@ -23,6 +23,7 @@ mod bindings {
 use bindings::*;
 mod automatic;
 mod delivery_diagnostics;
+mod diagnostic_view;
 mod journal_io;
 mod lifecycle_diagnostics;
 struct Plugin;
@@ -154,6 +155,7 @@ fn refresh_panel() {
 }
 impl Guest for Plugin {
     fn init() -> Result<(), String> {
+        diagnostic_view::reset();
         lifecycle_diagnostics::reset();
         journal_io::reset();
         // A host sensor exists only after successful inventory registration.
@@ -341,6 +343,7 @@ impl Guest for Plugin {
             }),
             children: vec![],
         });
+        diagnostic_view::append(&mut nodes);
         Ok(UiTree { nodes })
     }
     fn on_action(
@@ -352,6 +355,9 @@ impl Guest for Plugin {
         use niles::integration::ui::{ActionResult, ActionValue};
         if surface != "withings" {
             return Err("Unknown surface".into());
+        }
+        if action_id.starts_with("diagnostics:") {
+            return diagnostic_view::action(&action_id, value);
         }
         let mut parts = action_id.rsplitn(2, ':');
         let generation: u64 = parts

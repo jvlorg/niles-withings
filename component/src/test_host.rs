@@ -841,6 +841,83 @@ fn diagnostics_presence_failure_has_no_action_and_recovers_without_reclaim() {
 }
 
 #[test]
+fn diagnostic_view_uses_read_only_export_and_snapshot_guard() {
+    use niles::integration::ui::{ActionValue, NodeKind};
+    reset();
+    Plugin::init().unwrap();
+    for _ in 0..30 {
+        record_event("lifecycle", "reconcile", "ready");
+    }
+    let before = LEDGER.with(|l| {
+        let l = l.borrow();
+        (
+            l.storage.clone(),
+            l.secrets.clone(),
+            l.requests.len(),
+            l.actions.len(),
+        )
+    });
+    let press = |id: &str| {
+        Plugin::on_action(
+            "withings".into(),
+            id.into(),
+            ActionValue::Pressed,
+            context(),
+        )
+    };
+    let first = Plugin::render("withings".into(), context()).unwrap();
+    assert!(
+        first
+            .nodes
+            .iter()
+            .any(|n| matches!(&n.kind,NodeKind::Button(b) if b.id=="diagnostics:first"))
+    );
+    press("diagnostics:first").unwrap();
+    let view = Plugin::render("withings".into(), context()).unwrap();
+    let raw = view
+        .nodes
+        .iter()
+        .find_map(|n| match &n.kind {
+            NodeKind::Text(t) if t.value.starts_with('{') => Some(t.value.clone()),
+            _ => None,
+        })
+        .unwrap();
+    let page: serde_json::Value = serde_json::from_str(&raw).unwrap();
+    assert_eq!(page["records"].as_array().unwrap().len(), 25);
+    let next = view
+        .nodes
+        .iter()
+        .find_map(|n| match &n.kind {
+            NodeKind::Button(b) if b.id.starts_with("diagnostics:next:") => Some(b.id.clone()),
+            _ => None,
+        })
+        .unwrap();
+    press(&next).unwrap();
+    let after = LEDGER.with(|l| {
+        let l = l.borrow();
+        (
+            l.storage.clone(),
+            l.secrets.clone(),
+            l.requests.len(),
+            l.actions.len(),
+        )
+    });
+    assert_eq!(before, after);
+    record_event("lifecycle", "reconcile", "ready");
+    assert!(press(&next).is_err());
+    press("diagnostics:first").unwrap();
+    press("diagnostics:hide").unwrap();
+    let hidden = Plugin::render("withings".into(), context()).unwrap();
+    assert!(
+        !hidden
+            .nodes
+            .iter()
+            .any(|n| matches!(&n.kind,NodeKind::Text(t) if t.value.starts_with('{')))
+    );
+    assert!(press("diagnostics:next:1:bad").is_err());
+}
+
+#[test]
 fn diagnostics_tool_is_strict_read_only_and_invalidates_stale_pages() {
     reset();
     Plugin::init().unwrap();
