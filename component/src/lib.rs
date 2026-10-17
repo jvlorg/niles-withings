@@ -158,6 +158,17 @@ impl HttpTransport for HostTransport {
             timeout_ms: Some(5000),
         })
         .map_err(|_| "Provider request failed".to_string())?;
+        if response.body.len() <= 65536
+            && let Ok(value) = serde_json::from_slice::<serde_json::Value>(&response.body)
+            && let Some(status) = value.get("status").and_then(|v| v.as_i64())
+            && status != 0
+        {
+            // Only numeric protocol status: never payloads, URLs or credentials.
+            eprintln!(
+                "Withings request rejected: HTTP {}, provider status {}",
+                response.status, status
+            );
+        }
         Ok(HttpResponse {
             status: response.status,
             body: response.body,
