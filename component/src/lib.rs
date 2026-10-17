@@ -577,7 +577,7 @@ impl Guest for Plugin {
                     &secret,
                     now()?,
                 )
-                .map_err(|_| "Account callback failed".to_string())
+                .map_err(|error| format!("Account callback failed: {error}"))
         })?;
         match outcome {
             niles_withings::application::CallbackResult::Denied => {
