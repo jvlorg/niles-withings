@@ -3,7 +3,7 @@
 ## Goal and current boundary
 Standalone, automation-first Niles add-on: Connect → automatically discover and activate all eligible Sleep Monitor mats, each with independent identity, presence, `bed_in` / `bed_out` actions. In-bed is not asleep. Scale/history remain V2. This is development work, not a stable release.
 
-The automatic implementation is a local candidate. Installed/published alpha.7 remains unchanged. Alpha.7 has real evidence for OAuth (`user.info,user.sleepevents`), Aura Sensor V2 Sleep Monitor discovery, manual selection, subscription readiness and both event directions. Physical detection is delayed (>1–2 minutes reported); latency attribution is not measured. Live automatic activation and a full installed-process restart/dedup test remain outstanding.
+Alpha.8 is now published and installed on test Niles through the normal preview/update API, with both artifact digests verified and no added permissions. Installed readback is running: the saved account loaded, one mat activated automatically, subscriptions are ready, and legacy `x_withings:bedroom/withings_sleep` identity is retained. Occupancy is correctly unknown pending a fresh event. Production remains unchanged. Alpha.7 has real evidence for OAuth (`user.info,user.sleepevents`), Aura Sensor V2 Sleep Monitor discovery, manual selection, subscription readiness and both event directions. Physical detection is delayed (>1–2 minutes reported); latency attribution is not measured. Fresh physical-event acceptance on alpha.8, live multi-mat validation and a full installed-process restart/dedup test remain outstanding.
 
 ## Implemented candidate
 - Shared account OAuth, encrypted refresh and subscription lifecycle remains in `runtime::Owner`; `runtime::devices::DeviceRegistry` owns independent account/device-scoped adapters.
@@ -28,16 +28,16 @@ The component migration test constructs the legacy Owner selection/accept/event 
 - [x] Real pinned Niles 0.3 checker and disconnected dev-host render accept the automatic candidate. Maintained command: `scripts/verify-niles03-host.sh <absolute-host> <fresh-absolute-scratch-output>`. Fresh setup renders Connect, zero mats, delivery not ready; it no longer invents a phantom sensor.
 - [ ] Optional diagnostics menu visibility. Pinned host builds menu from static `manifest.ui.menu`; no supported per-install runtime setting found. The existing menu remains visible. No fake toggle or core/WIT patch.
 - [ ] Remove legacy account restriction from settings without bypassing it. Niles rejects `config.get` for undeclared settings; retain optional `user_id`, labelled legacy and normally blank, until a deliberate host/migration solution. Removing the declaration while retaining Rust checks is not compatibility.
-- [ ] Review and publish/install a new prerelease through the supported Niles flow; automatic candidate is not live.
+- [x] Published/installed `v0.1.0-alpha.8`, release commit `e590a45543761b15d28099ec9f7bbd19ef481b58`. Private pre-update PostgreSQL backup completed. Readback proves automatic single-mat migration and subscription readiness; real fresh entry/exit and full host restart remain pending.
 - [ ] Full installed-host restart, encrypted storage durability and no-replayed automation action acceptance.
 
 ## Safety and evidence limits
-- No automatic candidate deployment, provider calls, production changes or household actuation during this refactor.
+- Offline implementation made no provider/service changes. The subsequent explicitly approved alpha.8 release/test updated only test Niles; its normal startup performed automatic discovery and subscription reconciliation. Dry-run remains enabled; production and household actuation are untouched.
 - Real alpha.7 callbacks prove event receipt, not current physical posture or measured physical latency. Live test is dry-run.
 - Credential refresh persists pending intent before rotation and fails closed across restart; restore validates account, format/version and metadata first.
 - Presence persists before publication. A post-commit reading/action publication failure can permanently lose that publication; no outbox/exactly-once claim.
 - Account secrets, host-ID registry and presence storage are independent; no cross-store transaction claim.
-- Temporary outbound `bridge` was found still attached and has now been disconnected under the original close-after-testing instruction. Readback confirmed only `test-niles_isolated`; local `/healthz` returned 200. Provider refresh/discovery requires an approved outbound path before live testing resumes. This does not change or establish the public hostname's Cloudflare Access policy.
+- Temporary outbound was closed after offline work, then reopened with approval for the alpha.8 release/test. Readback now confirms `bridge` plus `test-niles_isolated`; keep this window explicitly temporary and close it when physical testing finishes or pauses. No Cloudflare Access policy changes.
 - Harness retirement and subscription ownership cleanup remain separate; never revoke installed add-on subscriptions as incidental cleanup.
 
 ## Repeatable commands
