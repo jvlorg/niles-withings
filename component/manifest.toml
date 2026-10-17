@@ -15,15 +15,11 @@ callback = true
 webhook = true
 http = ["account.withings.com", "wbsapi.withings.net"]
 
+# Retained because Niles rejects config.get for undeclared settings. Existing
+# explicit restrictions must not silently disappear during this migration.
 [[settings]]
 key = "user_id"
-label = "Withings user ID"
-type = "string"
-required = false
-
-[[settings]]
-key = "device_id"
-label = "Sleep device ID (optional; retained for existing setups)"
+label = "Legacy account restriction (normally leave blank)"
 type = "string"
 required = false
 

@@ -15,7 +15,7 @@ p = Path(sys.argv[1])
 check, dev = (p/'check.log').read_text(), (p/'dev.log').read_text()
 assert 'It would install.' in check
 assert 'plugin@0.3' in check
-for expected in ['status: Working', 'withings_sleep', 'unavailable', 'Connect Withings', 'Occupancy unknown']:
+for expected in ['status: Working', 'Connect Withings', '0 supported sleep mats', 'delivery is not ready']:
     assert expected in dev, expected
 print('PASS real Niles 0.3 component load and disconnected startup; NOT live provider proof')
 PY

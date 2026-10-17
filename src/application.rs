@@ -102,6 +102,9 @@ impl SecureAccountRecord {
     pub fn user_id(&self) -> u64 {
         self.user_id
     }
+    pub fn usable_at(&self, now: i64) -> bool {
+        self.user_id != 0 && now >= self.acquired_at && now < self.expires_at
+    }
     pub fn access_token(&self) -> Result<Secret, ApplicationError> {
         let serialized = self.serialize()?;
         let wire: AccountRecordWire =

@@ -483,6 +483,9 @@ pub mod adapter {
         pub fn state(&self) -> &State {
             &self.state
         }
+        pub fn identity(&self) -> &Identity {
+            &self.identity
+        }
         pub fn deliver(
             &mut self,
             body: &[u8],

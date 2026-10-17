@@ -1,54 +1,54 @@
 # Withings V1 goal and acceptance ledger
 
-## Goal
-Standalone Niles add-on for Sleep mat in-bed / out-of-bed state and automation events. In-bed is not asleep. History/analysis is V2; Body+ is secondary.
+## Goal and current boundary
+Standalone, automation-first Niles add-on: Connect → automatically discover and activate all eligible Sleep Monitor mats, each with independent identity, presence, `bed_in` / `bed_out` actions. In-bed is not asleep. Scale/history remain V2. This is development work, not a stable release.
 
-## Current status
+The automatic implementation is a local candidate. Installed/published alpha.7 remains unchanged. Alpha.7 has real evidence for OAuth (`user.info,user.sleepevents`), Aura Sensor V2 Sleep Monitor discovery, manual selection, subscription readiness and both event directions. Physical detection is delayed (>1–2 minutes reported); latency attribution is not measured. Live automatic activation and a full installed-process restart/dedup test remain outstanding.
 
-### Executable add-on application boundary (offline plus wired host adapter)
+## Implemented candidate
+- Shared account OAuth, encrypted refresh and subscription lifecycle remains in `runtime::Owner`; `runtime::devices::DeviceRegistry` owns independent account/device-scoped adapters.
+- The actual component callback/startup/refresh control/timer uses automatic discovery. No user selection or device-ID input is needed. Each eligible mat gets a deterministic account/device host ID, not an inventory-order or display-name ID.
+- Inventory validity and subscription readiness are separate gates. Failed discovery/storage/registration revokes delivery; healthy lifecycle alone cannot override invalid inventory. Removed devices become unavailable. Unchanged successful discovery retains fresh occupancy.
+- Presence restoration is unknown and replayed events are silent. Setup emits no bed action. Revocation clears cached occupancy.
+- Per-device host registration, publication and HTTP/storage imports are isolated in `component/src/host_adapter.rs`; fleet/legacy compatibility is in `component/src/automatic.rs`. Obsolete singleton sink and manual selection/switch UI are removed. Legacy neutral coordinator APIs remain for migration regression coverage, not the normal component path.
+- Durable `host_devices` records all owned host IDs before registration, including retired IDs, so cold startup can revoke stale host availability even when credentials cannot restore. This registry is bounded to 128 historical host IDs and 64 KiB; capacity/storage failure blocks activation rather than silently losing ownership.
 
-The component targets pinned WIT 0.3.0 and now derives identity from callback-issued tokens and bounded validated encrypted-record restore. `user_id` is optional and acts only as an explicit account restriction; invalid configured values fail closed. Entry-point tests exercise no-user-id callback → render selection → select → bed event and simulated restart restore; no live provider execution is claimed. Persist-before-publication still has a post-commit retry-loss window.
+## Alpha.7 migration contract
+A valid persisted `selection` remains the authority for the old `room/withings_sleep` alias, only for its exact authenticated account/device pair. That mat retains its host identity and the unchanged account/device-scoped presence key. Additional mats use deterministic IDs. A replacement account cannot inherit the alias or history. Selection bytes are preserved, not rewritten into new ownership. Corrupt selection blocks delivery rather than silently renaming the mat.
 
-Withings device discovery is now implemented as an offline transport seam: `POST https://wbsapi.withings.net/v2/user`, form `action=getdevice`, bearer token; bounded JSON `body.devices` parse of `deviceid`, `type`, `model`, `model_id`. Response limits reuse the 64 KiB response bound; rows limited to 256 and fields bounded. Device Debug redacts opaque identifiers. Host-neutral setup helper APIs compose the secure callback record, discovery, an explicit candidate/choice acceptance, bounded versioned non-secret account/device selection, and construction of the existing event Adapter only after selection save succeeds. The secret and selection stores are independent, so this deliberately makes no cross-store atomicity claim. A selection from a new OAuth account is not eligible; corrupt/foreign selection fails closed, while a missing or conflicting selected ID is stale and never switches. Existing manual component config remains unchanged.
+The component migration test constructs the legacy Owner selection/accept/event flow using the same storage, then starts the automatic Plugin and proves legacy identity, unknown restoration, duplicate suppression, a second independent mat and new-account isolation. This is synthetic in-memory process-recreation evidence, not live database durability.
 
-Official API reference: https://developer.withings.com/api-reference/#operation/userv2-getdevice . Its current schema specifies `type` values including `Sleep Monitor` and `Scale`, with `model`, `model_id`, and `deviceid`; its published Sleep Monitor models are `Aura Dock` (60), `Aura Sensor` (61), and `Aura Sensor V2` (63). It does not list the Withings Sleep Analyzer. We therefore use only the documented type field to identify the eligible sleep-monitor category, without asserting those Aura models are the Sleep Analyzer. Exact Sleep Analyzer model/type compatibility remains unresolved pending an authoritative listing. This avoids fabricated model matches.
+## Verification and acceptance
+- [x] Bounded parser/reducer, persistent cursor/dedup and scoped adapter tests.
+- [x] Automatic registry and composed Owner tests, including two mats and expiry refusal before HTTP.
+- [x] Actual Plugin entrypoint tests: automatic zero/one/two-mat setup, isolated actions, entry/duplicate/exit, restart unknown, callback denial, corrupt account/selection, stale control, account restriction/replacement, refresh final-save failure, transient subscriptions, removed devices, registration/storage failures with successful retry, and cold-start stale-host revocation.
+- [x] Legacy migration identity and scoped-history test.
+- [x] Removed normal device-ID setting and selection controls; no numeric account ID required.
+- [x] Main final verification: 111 workspace tests, formatting, strict all-target Clippy, release component Wasm, diff checks, fresh replay, positive runtime-check and intentionally failing negative runtime-check all behaved as required. Logs are in managed scratch `withings-automatic-final-checks-2`; final host proof has no undeclared-setting warning.
+- [x] Real pinned Niles 0.3 checker and disconnected dev-host render accept the automatic candidate. Maintained command: `scripts/verify-niles03-host.sh <absolute-host> <fresh-absolute-scratch-output>`. Fresh setup renders Connect, zero mats, delivery not ready; it no longer invents a phantom sensor.
+- [ ] Optional diagnostics menu visibility. Pinned host builds menu from static `manifest.ui.menu`; no supported per-install runtime setting found. The existing menu remains visible. No fake toggle or core/WIT patch.
+- [ ] Remove legacy account restriction from settings without bypassing it. Niles rejects `config.get` for undeclared settings; retain optional `user_id`, labelled legacy and normally blank, until a deliberate host/migration solution. Removing the declaration while retaining Rust checks is not compatibility.
+- [ ] Review and publish/install a new prerelease through the supported Niles flow; automatic candidate is not live.
+- [ ] Full installed-host restart, encrypted storage durability and no-replayed automation action acceptance.
 
-Latest live evidence is historical and documented in [live provider evidence](live-provider-evidence.md). This package made no live provider calls, changed no live services, and now wires discovery into the component without executing live discovery. No device/user credentials or private files were accessed.
+## Safety and evidence limits
+- No automatic candidate deployment, provider calls, production changes or household actuation during this refactor.
+- Real alpha.7 callbacks prove event receipt, not current physical posture or measured physical latency. Live test is dry-run.
+- Credential refresh persists pending intent before rotation and fails closed across restart; restore validates account, format/version and metadata first.
+- Presence persists before publication. A post-commit reading/action publication failure can permanently lose that publication; no outbox/exactly-once claim.
+- Account secrets, host-ID registry and presence storage are independent; no cross-store transaction claim.
+- Temporary outbound `bridge` was found still attached and has now been disconnected under the original close-after-testing instruction. Readback confirmed only `test-niles_isolated`; local `/healthz` returned 200. Provider refresh/discovery requires an approved outbound path before live testing resumes. This does not change or establish the public hostname's Cloudflare Access policy.
+- Harness retirement and subscription ownership cleanup remain separate; never revoke installed add-on subscriptions as incidental cleanup.
 
-## Acceptance ledger
-- [x] Official bed category/payload/transport contract documented.
-- [x] Parser and state core compile; replay sequence executed; parser/state tests pass.
-- [x] Exact pinned Niles WIT 0.3 vendored with provenance and verified SHA-256.
-- [x] Local Niles 0.2.1 checker and `plugin dev` accepted generated component and synthetic setup; disconnected status/UI verified.
-- [x] Host-neutral event/action mapping, lifecycle and composed callback → secure record restore → subscription readback → bed events → restart covered offline.
-- [x] Documented `user.getdevice` transport parser and bounded account/device selection tested with clearly synthetic fixtures; explicit persisted acceptance gates Adapter construction.
-- [x] Webhook store load/save, reading publish, and action publish failure seams exercised; 503 and committed retry-loss behavior confirmed.
-- [x] Stateful setup coordinator owns the active adapter and setup/discovery generation, invalidates delivery on account change, device refresh/switch, and discovery errors; selection must be durable before adapter activation. Account/device isolation and stale discovery acceptance are represented by generation-bound API. Coordinator activation now requires a key-value backend and internally derives account/device-scoped storage; unscoped activation helpers are private. Main exercised account switching, stale generation rejection, save failure, stale-discovery activation refusal, and old-account webhook rejection. Main also verified mat-switch/back persistence isolation.
-- [x] Account/device-scoped presence storage and coordinator mat-A → mat-B → mat-A restart proof; restored readings unknown, duplicate actions suppressed, new exit delivered, other scopes unchanged. Injected load/save failures fail closed and recovery executes.
-- [x] Definitive unsafe lifecycle statuses (`AuthorizationRequired`, `RefreshPersistenceFailed`) revoke the coordinator adapter/binding/discovery, advance generation, and require validated restoration before discovery/activation. `Ready` cannot bypass recovery; `SubscriptionsIncomplete` only clears readiness and preserves an already-valid event handler. Synthetic coordinator regressions cover revocation, recovery, presentation and retained webhook delivery; persistent selection/presence stores are untouched.
-29|- [x] Host WIT 0.3 storage/secret/HTTP/device adapter and runtime owner composition compile. Timer-driven subscription/refresh reconciliation, interactive selection, encrypted record identity restore and optional explicit account restriction are wired; no fallback secret storage.
-- [ ] Verify official device model/category for the exact Withings Sleep Analyzer; published API schema currently lists Aura models only under Sleep Monitor.
-- [ ] Account/device provider validation and separately authorized physical validation.
-
-## Runtime composition
-`runtime::Owner` owns lifecycle and coordinator privately, restores supplied encrypted store records, reads back callback persistence, forwards reconciliation outcomes automatically, and updates discovery credentials after rotation. Main repaired the initial early-return restore bug and resets stale lifecycle credentials before failed restore/callback paths. Public runtime APIs now expose explicit mat switching (revokes adapter and advances generation without changing credentials or stored selection/history) and in-memory pause (drops credentials/lifecycle/adapter without provider unsubscribe or stored-secret deletion). Reconciliation fails closed if secure-record reconstruction fails. The component now wires the pinned 0.3 imports; real host execution remains unverified. Main extended public runtime tests for switch/stale-generation refusal, pause without provider calls or secret deletion, validated restore with duplicate suppression, and active-owner callback denial/invalid-response/save/readback failure followed by delivery refusal and no stale-credential reconciliation. Main also corrected reconciliation's returned status when record reconstruction fails. Specification approval was posted and read back on upstream #439 at 03c4b55 as JVLHome; implementation/live acceptance remains separate.
-
-## Safety and state contract
-Presence and lifecycle readiness remain separate. Refresh now atomically persists a version-2 pending marker in the same encrypted record before contacting the provider. Restore rejects pending records with RecoveryRequired; old readers reject version 2. Restore validates version/state pairing, account and metadata before returning RecoveryRequired; foreign or malformed pending records return InvalidRecord. Successful replacement returns to a complete version-1 record. Failed intent persistence sends no HTTP; ambiguous refresh outcomes stay blocked. A crash before the request may conservatively require reconnect. Five offline regressions cover pending restore, completed refresh restore, final-save failure, intent failure and foreign-account response. Actual host-neutral callback recovery now restores usable credentials and reaches synthetic subscription Ready; failed callback persistence preserves pending bytes, and ambiguous transport failure blocks retry. Existing five refresh regressions are retained alongside four new tests. Browser/host wiring and crash injection across every boundary remain unproven. Test Niles remains publicly accessible without Cloudflare Access at Johan’s explicit direction. The secure-store trait requires atomic encrypted replacement of tokens plus metadata. Adapter persistence precedes publication; if committed-event publication fails, duplicate delivery does not retry missing publication. This is at-most-once attempt behavior, not reliable delivery or exactly-once. `Ready` refers only to lifecycle reconciliation, not live host connectivity, callback delivery, event receipt, or bed presence.
-
-## Verification
-Main verified workspace formatting, strict workspace Clippy, and the existing workspace suite plus four new component-boundary tests (no doc tests). Coordinator-specific account-switch, lifecycle revocation/recovery, subscription-incomplete retention, and failure-path tests execute. Mat-switch/back namespace restoration, separate-account history, and load/save failure recovery pass through the coordinator. Main additionally proved persistent selection/presence bytes survive revocation and recovery suppresses duplicate bed_in using the same backing store. No live external tests or provider/service calls were performed. Actual host 0.3 loading and disconnected startup pass via `bash scripts/verify-niles03-host.sh <absolute-niles03-cli> <fresh-absolute-scratch-dir>`. Host source pin is `2511026a01a111b0dcdf1287b54ce372f4555bc6`; its WIT and niles-plugins/src were compared byte-for-byte with merged #444 (`861a86448319e8cc14c8fd7a681768a3158dc8c4`) and match. The exact merged #444 source (`861a86448319e8cc14c8fd7a681768a3158dc8c4`) subsequently built successfully and passed that same maintained checker/dev-host script. Evidence is in `/home/jleth/.hermes/profiles/main/cache/scratch/withings-merged03-proof/{check.log,dev.log}`: “It would install”, registered unavailable sensor, and AuthorizationRequired/Unknown status. Connected OAuth/provider/storage durability remains unverified.
-
-The new executable `cargo run --bin withings-runtime-check` composes the public runtime Owner through callback/store readback, discovery, acceptance, event delivery, drop/restore and activation, duplicate suppression, and refresh final-save failure with blocked delivery. It uses injected synthetic transport and shared in-memory persistence; restart is simulated and does not establish disk durability. It prints `OFFLINE SYNTHETIC NOT HOST0.3`. `cargo run --bin withings-runtime-check -- --break-refresh-response` is a deliberate negative scenario expected to exit nonzero. Neither command makes network/provider calls or proves host 0.3 integration.
-
-## Setup panel
-45|The component renders a read-only account/status panel plus host-native candidate selection and explicit retry/switch controls. Mat choice flows from the rendered WIT control with generation tag to `Owner::accept`; stale generations are rejected before persistence. Identity comes from validated encrypted account record; optional configured `user_id` restricts identity and malformed values fail closed. Startup restores the durable selected mat only after current inventory confirms it; occupancy starts unknown. Selection is account-bound, so another OAuth account does not inherit an old mat. Synthetic component entrypoint tests cover no-id onboarding and restart; this does not prove live OAuth or provider delivery.
-
-## Commands
-`cargo fmt --all -- --check`
-`cargo clippy --workspace --all-targets -- -D warnings`
-`cargo test --workspace`
-`cargo run --bin withings-replay -- <new-synthetic-state-file>`
-`cargo run --bin withings-runtime-check`
-`cargo run --bin withings-runtime-check -- --break-refresh-response` (expected nonzero)
-The old `scripts/verify-niles-host.sh` targets the historical disconnected 0.2.1 component; it is not a validation command for this 0.3 candidate.
+## Repeatable commands
+```text
+cargo fmt --all -- --check
+cargo test --workspace
+cargo clippy --workspace --all-targets -- -D warnings
+cargo build -p niles-withings-component --target wasm32-wasip2 --release
+cargo run --bin withings-replay -- <new-synthetic-state-file>
+cargo run --bin withings-runtime-check
+cargo run --bin withings-runtime-check -- --break-refresh-response
+scripts/verify-niles03-host.sh <absolute-niles03-cli> <fresh-absolute-scratch-directory>
+```
+The runtime-check executable retains the legacy single-selection composition as a compatibility proof; the new automatic path is covered by `tests/automatic_owner.rs` and actual component tests. The deliberately broken refresh fixture must exit nonzero. The old 0.2 verifier is historical, not a gate for the current 0.3 component. Exact WIT remains pinned and unmodified; merged host source pin: `861a86448319e8cc14c8fd7a681768a3158dc8c4`.

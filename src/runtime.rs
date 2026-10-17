@@ -1,4 +1,5 @@
 //! Compact host-neutral owner for credentials, subscription lifecycle and event delivery.
+pub mod devices;
 use crate::{
     adapter::Sink,
     application::{
@@ -6,7 +7,7 @@ use crate::{
     },
     coordinator::{Coordinator, ScopedBackend, ScopedStore, SetupView},
     lifecycle::{self, Clock, Lifecycle, LifecycleStatus, SecureTokenStore},
-    withings_client::{CallbackUrl, HttpTransport, Secret},
+    withings_client::{self, CallbackUrl, HttpTransport, Secret},
 };
 
 pub trait AccountRecordRead: AccountSecretStore {
@@ -17,6 +18,8 @@ pub trait AccountRecordRead: AccountSecretStore {
 pub struct Owner<B: ScopedBackend, H: Sink> {
     lifecycle: Lifecycle,
     coordinator: Coordinator<ScopedStore<B>, H>,
+    registry: devices::DeviceRegistry<B, H>,
+    automatic: bool,
     record: Option<application::SecureAccountRecord>,
 }
 
@@ -26,6 +29,8 @@ impl<B: ScopedBackend, H: Sink> Owner<B, H> {
         Self {
             lifecycle: Lifecycle::new(0, None, None),
             coordinator: Coordinator::default(),
+            registry: devices::DeviceRegistry::new(),
+            automatic: false,
             record: None,
         }
     }
@@ -37,6 +42,8 @@ impl<B: ScopedBackend, H: Sink> Owner<B, H> {
         now: i64,
     ) -> Result<(), application::ApplicationError> {
         self.record = None;
+        self.registry.revoke_all();
+        self.automatic = false;
         self.lifecycle = Lifecycle::new(0, None, None);
         // Deliberately revoke before reading; missing bytes are expected here.
         let _ = self.coordinator.restore_account(None, account, now);
@@ -65,6 +72,8 @@ impl<B: ScopedBackend, H: Sink> Owner<B, H> {
         now: i64,
     ) -> Result<CallbackResult, application::ApplicationError> {
         self.record = None;
+        self.registry.revoke_all();
+        self.automatic = false;
         self.lifecycle = Lifecycle::new(0, None, None);
         self.coordinator
             .set_lifecycle(lifecycle::Status::AuthorizationRequired);
@@ -112,17 +121,23 @@ impl<B: ScopedBackend, H: Sink> Owner<B, H> {
     /// Begin choosing a replacement mat without changing durable credentials,
     /// selection, or presence history. Delivery is revoked until acceptance.
     pub fn switch_mat(&mut self) {
+        self.registry.revoke_all();
+        self.automatic = false;
         self.coordinator.switch_device();
     }
     /// Record a failed interactive discovery attempt and revoke the active
     /// selection without modifying its durable selection or presence history.
     pub fn discovery_failed(&mut self) {
+        self.registry.revoke_all();
+        self.automatic = false;
         self.coordinator.discovery_failed();
     }
     /// Pause this in-memory owner. No provider unsubscribe or stored-secret
     /// deletion is performed; callers may restore validated credentials later.
     pub fn pause(&mut self) {
         self.record = None;
+        self.registry.revoke_all();
+        self.automatic = false;
         self.lifecycle = Lifecycle::new(0, None, None);
         self.coordinator.begin_account(None);
     }
@@ -141,6 +156,9 @@ impl<B: ScopedBackend, H: Sink> Owner<B, H> {
             .lifecycle
             .reconcile_at(t, s, c, client_id, secret, callback, comment);
         self.coordinator.set_lifecycle(status.status);
+        if status.status != lifecycle::Status::Ready {
+            self.registry.set_delivery_enabled(false);
+        }
         if matches!(
             status.status,
             lifecycle::Status::Ready | lifecycle::Status::SubscriptionsIncomplete
@@ -156,11 +174,19 @@ impl<B: ScopedBackend, H: Sink> Owner<B, H> {
                     subscriptions: [false; 2],
                 };
                 self.lifecycle = Lifecycle::new(0, None, None);
+                self.registry.revoke_all();
+                self.automatic = false;
                 self.coordinator
                     .set_lifecycle(lifecycle::Status::AuthorizationRequired);
             }
         } else {
             self.record = None;
+            self.registry.revoke_all();
+            self.automatic = false;
+        }
+        if self.automatic {
+            self.registry
+                .set_delivery_enabled(status.status == lifecycle::Status::Ready);
         }
         status
     }
@@ -171,7 +197,52 @@ impl<B: ScopedBackend, H: Sink> Owner<B, H> {
         max_age: i64,
         skew: i64,
     ) -> WebhookResponse {
-        self.coordinator.webhook(request, now, max_age, skew)
+        if self.automatic {
+            self.registry.webhook(request, now, max_age, skew)
+        } else {
+            self.coordinator.webhook(request, now, max_age, skew)
+        }
+    }
+
+    pub fn discover_automatic<T: HttpTransport, BF, SF>(
+        &mut self,
+        transport: &mut T,
+        now: i64,
+        backend_factory: BF,
+        sink_factory: SF,
+    ) -> Result<devices::ReconcileResult, application::ApplicationError>
+    where
+        BF: FnMut(&withings_client::Device) -> B,
+        SF: FnMut(&withings_client::Device) -> H,
+    {
+        self.automatic = true;
+        self.registry.set_delivery_enabled(false);
+        let record = self
+            .record
+            .as_ref()
+            .ok_or(application::ApplicationError::RecoveryRequired)?;
+        if !record.usable_at(now) {
+            self.registry.revoke_all();
+            self.automatic = true;
+            return Err(application::ApplicationError::RecoveryRequired);
+        }
+        let token = record.access_token()?;
+        let inventory = match withings_client::list_devices(transport, &token) {
+            Ok(devices) => devices,
+            Err(_) => {
+                self.registry.revoke_all();
+                self.automatic = true;
+                return Err(application::ApplicationError::Provider);
+            }
+        };
+        let result = self
+            .registry
+            .reconcile_inventory(record.user_id(), &inventory, backend_factory, sink_factory)
+            .map_err(|_| application::ApplicationError::InvalidRecord)?;
+        self.automatic = true;
+        self.registry
+            .set_delivery_enabled(self.lifecycle.status(now).status == lifecycle::Status::Ready);
+        Ok(result)
     }
     pub fn generation(&self) -> u64 {
         self.coordinator.generation()

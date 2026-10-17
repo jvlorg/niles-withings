@@ -16,165 +16,12 @@ use std::{cell::RefCell, rc::Rc};
 #[cfg(test)]
 use test_host as host;
 wit_bindgen::generate!({world:"plugin",path:"wit/niles-integration.wit"});
+mod automatic;
 struct Plugin;
 export!(Plugin);
 
-#[derive(Clone)]
-struct HostStore;
-impl HostStore {
-    fn get(key: &str) -> Result<Option<String>, String> {
-        Ok(storage::get(key))
-    }
-    fn set(key: &str, value: &str) -> Result<(), String> {
-        storage::set(key, value).map_err(|_| "Host storage write failed".to_string())
-    }
-}
-impl AccountSecretStore for HostStore {
-    type Error = String;
-    fn set_account_record(&mut self, value: &str) -> Result<(), String> {
-        secrets::set("account", value).map_err(|_| "Encrypted account write failed".into())
-    }
-}
-impl AccountRecordRead for HostStore {
-    fn read_account_record(&mut self) -> Result<Option<String>, String> {
-        secrets::get("account")
-            .ok_or_else(|| "Encrypted account record missing".to_string())
-            .map(Some)
-    }
-}
-
-impl SelectionStore for HostStore {
-    type Error = String;
-    fn load_selection(&mut self) -> Result<Option<String>, String> {
-        Self::get("selection")
-    }
-    fn save_selection(&mut self, value: &str) -> Result<(), String> {
-        Self::set("selection", value)
-    }
-}
-impl ScopedBackend for HostStore {
-    type Error = String;
-    fn load_value(&mut self, key: &str) -> Result<Option<String>, String> {
-        Self::get(key)
-    }
-    fn save_value(&mut self, key: &str, value: &str) -> Result<(), String> {
-        Self::set(key, value)
-    }
-}
-#[derive(Clone, Default)]
-struct DeviceSink {
-    id: Rc<RefCell<Option<String>>>,
-    occupancy: Rc<RefCell<Option<bool>>>,
-}
-impl DeviceSink {
-    fn target(&self) -> Result<String, String> {
-        self.id
-            .borrow()
-            .clone()
-            .ok_or_else(|| "Registered Withings device is unavailable".into())
-    }
-    fn set_target(&self, id: String) {
-        *self.id.borrow_mut() = Some(id);
-    }
-}
-impl Sink for DeviceSink {
-    type Error = String;
-    fn publish_reading(&mut self, reading: Reading) -> Result<(), String> {
-        let id = self.target()?;
-        *self.occupancy.borrow_mut() = None;
-        let occupied = match reading {
-            Reading::Occupied { occupied, .. } => Some(occupied),
-            _ => None,
-        };
-        let result = match reading {
-            Reading::Unknown { .. } => devices::set_available(&id, false)
-                .map_err(|_| "Could not mark device unavailable".into()),
-            Reading::Occupied {
-                occupied,
-                observed_at,
-            } => devices::report_state(
-                &id,
-                &types::DeviceState {
-                    on: None,
-                    brightness: None,
-                    color_temp_kelvin: None,
-                    rgb: None,
-                    temperature_celsius: None,
-                    humidity_percent: None,
-                    battery_percent: None,
-                    open: None,
-                    motion: None,
-                    illuminance_lux: None,
-                    position: None,
-                    readings: vec![
-                        types::Reading {
-                            name: "in_bed".into(),
-                            value: if occupied { 1.0 } else { 0.0 },
-                            unit: None,
-                        },
-                        types::Reading {
-                            name: "observed_at".into(),
-                            value: observed_at as f64,
-                            unit: Some("unix_seconds".into()),
-                        },
-                    ],
-                },
-            )
-            .map_err(|_| "Could not publish Withings reading".to_string())
-            .and_then(|()| {
-                devices::set_available(&id, true)
-                    .map_err(|_| "Could not confirm availability".to_string())
-            }),
-        };
-        if result.is_ok() {
-            *self.occupancy.borrow_mut() = occupied;
-        }
-        result
-    }
-    fn publish_action(&mut self, action: &'static str) -> Result<(), String> {
-        devices::report_action(&self.target()?, action)
-            .map_err(|_| "Could not publish Withings action".into())
-    }
-}
-struct HostTransport;
-impl HttpTransport for HostTransport {
-    type Error = String;
-    fn post(&mut self, r: HttpRequest) -> Result<HttpResponse, String> {
-        let mut headers = vec![(
-            "content-type".into(),
-            "application/x-www-form-urlencoded".into(),
-        )];
-        if let Some(t) = r.bearer {
-            headers.push((
-                "authorization".into(),
-                format!("Bearer {}", t.expose_secret()),
-            ));
-        }
-        let response = http::send(&http::Request {
-            method: http::Method::Post,
-            url: r.url.into(),
-            headers,
-            body: Some(r.form.into_bytes()),
-            timeout_ms: Some(5000),
-        })
-        .map_err(|_| "Provider request failed".to_string())?;
-        if response.body.len() <= 65536
-            && let Ok(value) = serde_json::from_slice::<serde_json::Value>(&response.body)
-            && let Some(status) = value.get("status").and_then(|v| v.as_i64())
-            && status != 0
-        {
-            // Only numeric protocol status: never payloads, URLs or credentials.
-            eprintln!(
-                "Withings request rejected: HTTP {}, provider status {}",
-                response.status, status
-            );
-        }
-        Ok(HttpResponse {
-            status: response.status,
-            body: response.body,
-        })
-    }
-}
+mod host_adapter;
+use host_adapter::{DeviceSink, HostStore, HostTransport};
 
 fn setting(key: &str) -> Result<String, String> {
     match config::get(key) {
@@ -219,14 +66,29 @@ fn now() -> Result<i64, String> {
         .filter(|v| *v > 0)
         .ok_or_else(|| "Clock unavailable".into())
 }
-thread_local! { static OWNER: RefCell<Owner<HostStore, DeviceSink>> = RefCell::new(Owner::new()); static SINK: DeviceSink = DeviceSink::default(); }
+thread_local! { static OWNER: RefCell<Owner<HostStore, DeviceSink>> = RefCell::new(Owner::new()); }
 fn reconcile_owner(owner: &mut Owner<HostStore, DeviceSink>) -> Result<(), String> {
-    let hook = host::inbound::hook_url().ok_or("Public webhook URL unavailable")?;
-    let hook = withings_client::CallbackUrl::parse(&hook).map_err(|_| "Invalid webhook URL")?;
-    let client = setting("client_id")?;
-    let secret = Secret::new(config::secret("client_secret").ok_or("Client secret missing")?)
-        .map_err(|_| "Invalid client secret")?;
-    let clock = niles_withings::lifecycle::FixedClock(now()?);
+    let inputs = (|| -> Result<_, String> {
+        let hook = host::inbound::hook_url().ok_or("Public webhook URL unavailable")?;
+        let hook = withings_client::CallbackUrl::parse(&hook).map_err(|_| "Invalid webhook URL")?;
+        let client = setting("client_id")?;
+        let secret = Secret::new(config::secret("client_secret").ok_or("Client secret missing")?)
+            .map_err(|_| "Invalid client secret")?;
+        Ok((
+            hook,
+            client,
+            secret,
+            niles_withings::lifecycle::FixedClock(now()?),
+        ))
+    })();
+    let (hook, client, secret, clock) = match inputs {
+        Ok(inputs) => inputs,
+        Err(error) => {
+            owner.pause();
+            let _ = automatic::revoke();
+            return Err(error);
+        }
+    };
     let status = owner.reconcile(
         &mut HostTransport,
         &mut HostStore,
@@ -236,122 +98,59 @@ fn reconcile_owner(owner: &mut Owner<HostStore, DeviceSink>) -> Result<(), Strin
         &hook,
         "Niles Withings",
     );
+    let ready = status.status == niles_withings::lifecycle::Status::Ready;
+    automatic::FLEET.with(|f| {
+        let mut f = f.borrow_mut();
+        f.subscriptions_ready = ready;
+        f.ready = ready && f.inventory_valid;
+    });
+    if !ready {
+        automatic::revoke()?;
+    }
     match status.status {
         niles_withings::lifecycle::Status::Ready => Ok(()),
         _ => Err("Account or subscription reconciliation is incomplete".into()),
     }
 }
-#[allow(clippy::collapsible_if)]
 fn activate_saved() -> Result<(), String> {
-    let account = match account_id() {
-        Ok(account) => account,
-        Err(_) => {
-            let mut owner = OWNER.with(|o| std::mem::replace(&mut *o.borrow_mut(), Owner::new()));
-            owner.pause();
-            OWNER.with(|o| *o.borrow_mut() = owner);
-            return Err("Account restore failed".into());
-        }
-    };
-    let mut owner = OWNER.with(|o| std::mem::replace(&mut *o.borrow_mut(), Owner::new()));
-    let result = (|| {
-        let mut store = HostStore;
+    let account = account_id()?;
+    OWNER.with(|o| {
+        let mut owner = o.borrow_mut();
         owner
-            .restore(&mut store, account, now()?)
-            .map_err(|_| "Account restore failed".to_string())?;
-        // Refresh expired credentials first. A transient subscription failure
-        // may leave valid credentials; discovery itself enforces that boundary.
+            .restore(&mut HostStore, account, now()?)
+            .map_err(|e| format!("Account restore failed: {e}"))?;
         let _ = reconcile_owner(&mut owner);
-        let mut transport = HostTransport;
-        if owner.discover(&mut transport, &mut store, now()?).is_err() {
-            owner.discovery_failed();
-            return Err("Device discovery failed".into());
-        }
-        // Honor a legacy explicit device_id only when it exactly matches
-        // current, account-validated discovery. Never infer a replacement.
-        let mut accepted_configured = false;
-        if owner.presentation().selected.is_none() {
-            if let Some(config::SettingValue::Text(configured)) = config::get("device_id") {
-                if let Some(candidate) = owner
-                    .presentation()
-                    .candidates
-                    .into_iter()
-                    .find(|candidate| candidate.action_id() == configured)
-                {
-                    let generation = owner.generation();
-                    let sink = SINK.with(Clone::clone);
-                    sink.set_target(format!("{}/withings_sleep", setting("room")?));
-                    owner
-                        .accept(
-                            &mut store,
-                            candidate.action_id(),
-                            generation,
-                            HostStore,
-                            sink,
-                        )
-                        .map_err(|_| "Configured device selection failed".to_string())?;
-                    accepted_configured = true;
-                }
-            }
-        }
-        let sink = SINK.with(Clone::clone);
-        if !accepted_configured && owner.presentation().selected.is_some() {
-            sink.set_target(format!("{}/withings_sleep", setting("room")?));
-            owner
-                .activate(&mut store, account, HostStore, sink)
-                .map_err(|_| "Saved selection activation failed".to_string())?;
-        }
-        // Subscription failure is recoverable; do not block discovery/setup.
-        reconcile_owner(&mut owner)?;
-        Ok(())
-    })();
-    OWNER.with(|o| *o.borrow_mut() = owner);
-    result
+        automatic::discover(&mut owner, account)?;
+        let result = reconcile_owner(&mut owner);
+        automatic::FLEET.with(|f| {
+            let mut f = f.borrow_mut();
+            f.ready = result.is_ok() && f.inventory_valid;
+        });
+        result
+    })
 }
 fn refresh_panel() {
     #[cfg(not(test))]
     niles::integration::ui::invalidate("withings");
 }
-fn revoke_device() -> Result<(), String> {
-    SINK.with(|sink| {
-        *sink.occupancy.borrow_mut() = None;
-        devices::set_available(&sink.target()?, false)
-            .map_err(|_| "Could not revoke device availability".to_string())
-    })
-}
 impl Guest for Plugin {
     fn init() -> Result<(), String> {
-        let id = format!("{}/withings_sleep", setting("room")?);
-        devices::upsert(&types::Device {
-            id: id.clone(),
-            class: types::DeviceClass::Sensor,
-            light: types::LightCapabilities {
-                color_temp: false,
-                rgb: false,
-            },
-            controllable: false,
-            state: types::DeviceState {
-                on: None,
-                brightness: None,
-                color_temp_kelvin: None,
-                rgb: None,
-                temperature_celsius: None,
-                humidity_percent: None,
-                battery_percent: None,
-                open: None,
-                motion: None,
-                illuminance_lux: None,
-                position: None,
-                readings: vec![],
-            },
-        })
-        .map_err(|_| "Device registration failed".to_string())?;
-        SINK.with(|s| s.set_target(id.clone()));
-        devices::set_available(&id, false).map_err(|_| "Device availability failed".to_string())?;
+        // A host sensor exists only after successful inventory registration.
         // Connection/discovery failure is represented by the revoked runtime;
         // keep the plugin loaded so the host-owned Connect route remains usable.
         host::timers::every("lifecycle", 300)
             .map_err(|_| "Lifecycle timer unavailable".to_string())?;
-        let _ = activate_saved();
+        OWNER.with(|o| o.borrow_mut().pause());
+        automatic::reset_host()?;
+        if let Err(error) = activate_saved() {
+            automatic::FLEET.with(|f| {
+                f.borrow_mut().error = Some(if secrets::get("account").is_some() {
+                    format!("Reconnect Withings or retry discovery: {error}")
+                } else {
+                    "Connect Withings to discover sleep mats.".into()
+                })
+            });
+        }
         Ok(())
     }
     fn tools() -> Vec<ToolDef> {
@@ -362,7 +161,14 @@ impl Guest for Plugin {
         }]
     }
     fn call_tool(_: String, _: String) -> Result<String, String> {
-        Ok(OWNER.with(|o| format!("Withings runtime: {:?}", o.borrow().presentation())))
+        Ok(automatic::FLEET.with(|f| {
+            let f = f.borrow();
+            format!(
+                "Withings: {} detected mats; delivery {}",
+                f.sinks.len(),
+                if f.ready { "ready" } else { "not ready" }
+            )
+        }))
     }
     fn set_device(_: String, _: DeviceState) -> Result<(), String> {
         Err("Read only".into())
@@ -372,13 +178,17 @@ impl Guest for Plugin {
             return;
         }
         OWNER.with(|o| {
-            if reconcile_owner(&mut o.borrow_mut()).is_err() {
-                SINK.with(|s| {
-                    if let Ok(id) = s.target() {
-                        *s.occupancy.borrow_mut() = None;
-                        let _ = devices::set_available(&id, false);
-                    }
-                });
+            let mut owner = o.borrow_mut();
+            let account = account_id();
+            match account {
+                Ok(account) => {
+                    let _ = reconcile_owner(&mut owner);
+                    let _ = automatic::discover(&mut owner, account);
+                }
+                Err(_) => {
+                    owner.pause();
+                    let _ = automatic::revoke();
+                }
             }
         });
         refresh_panel();
@@ -388,111 +198,64 @@ impl Guest for Plugin {
         if surface != "withings" {
             return Err("Unknown surface".into());
         }
-        use niles::integration::ui::{Node, NodeKind, TextBlock};
-        use niles_withings::coordinator::{DiscoveryState, SubscriptionState};
-        let view = OWNER.with(|o| o.borrow().presentation());
-        let has_record = HostStore.read_account_record().ok().flatten().is_some();
-        let account = match (view.discovery, account_id().is_err(), has_record) {
-            (
-                DiscoveryState::AuthorizationRequired | DiscoveryState::InterruptedRefresh,
-                true,
-                true,
-            ) => "Reconnect Withings using the host Connect control.",
-            (_, true, true) => "Reconnect Withings using the host Connect control.",
-            (_, true, false) => "Connect Withings using the host Connect control.",
-            (
-                DiscoveryState::AuthorizationRequired | DiscoveryState::InterruptedRefresh,
-                false,
-                _,
-            ) => "Reconnect Withings using the host Connect control.",
-            (DiscoveryState::NotStarted, false, _) => {
-                "Connect Withings using the host Connect control."
+        use niles::integration::ui::{Button, ButtonStyle, Node, NodeKind, TextBlock};
+        let mut labels = vec!["Withings Sleep".to_string()];
+        automatic::FLEET.with(|f| {
+            let f = f.borrow();
+            labels.push(
+                if f.account.is_some() {
+                    "Withings account loaded."
+                } else {
+                    "Connect Withings using the host Connect control."
+                }
+                .into(),
+            );
+            labels.push(format!("{} supported sleep mats detected.", f.sinks.len()));
+            labels.push(
+                if f.ready {
+                    "Bed-event subscriptions ready."
+                } else {
+                    "Bed-event delivery is not ready."
+                }
+                .into(),
+            );
+            if let Some(error) = &f.error {
+                labels.push(error.clone());
             }
-            _ => "Withings account loaded.",
-        };
-        let mat = match view.discovery {
-            DiscoveryState::Selected => "Configured sleep mat selected.",
-            DiscoveryState::NoEligibleMats => "No supported sleep mat found in this account.",
-            DiscoveryState::StaleSelection => {
-                "Saved sleep mat is no longer available. No replacement was selected."
+            for (index, sink) in f.sinks.values().enumerate() {
+                let state = match *sink.occupancy.borrow() {
+                    Some(true) => "In bed",
+                    Some(false) => "Out of bed",
+                    None => "Occupancy unknown — waiting for a fresh bed event.",
+                };
+                labels.push(format!("Sleep mat {}: {state}", index + 1));
             }
-            DiscoveryState::Unavailable => "Sleep mat discovery is unavailable.",
-            DiscoveryState::Candidate | DiscoveryState::MultipleCandidates => {
-                "Choose the intended sleep mat below; no mat is selected yet."
-            }
-            _ => "Sleep mat not active.",
-        };
-        let subscriptions = match view.subscription {
-            SubscriptionState::Ready => "Bed-event subscriptions ready.",
-            SubscriptionState::Incomplete => "Bed-event subscriptions incomplete.",
-            SubscriptionState::NotConfigured => "Bed-event subscriptions not configured.",
-        };
+        });
         let mut nodes = vec![Node {
             kind: NodeKind::Stack,
             children: vec![],
         }];
-        let occupancy = SINK.with(|s| match *s.occupancy.borrow() {
-            Some(true) => "In bed",
-            Some(false) => "Out of bed",
-            None => "Occupancy unknown — waiting for a fresh bed event.",
-        });
-        for value in ["Withings Sleep", account, mat, subscriptions, occupancy] {
+        for value in labels {
             let index = nodes.len() as u32;
+            nodes[0].children.push(index);
             nodes.push(Node {
                 kind: NodeKind::Text(TextBlock {
-                    value: value.into(),
+                    value,
                     muted: false,
                 }),
                 children: vec![],
             });
-            nodes[0].children.push(index);
         }
-        use niles::integration::ui::{Button, ButtonStyle, Choice, ChoiceOption};
-        for action in &view.actions {
-            let (id, label, style) = match action {
-                niles_withings::coordinator::SetupAction::RetryDiscovery => {
-                    ("retry", "Retry discovery", ButtonStyle::Secondary)
-                }
-                niles_withings::coordinator::SetupAction::SwitchMat => {
-                    ("switch", "Choose another mat", ButtonStyle::Secondary)
-                }
-                niles_withings::coordinator::SetupAction::RefreshDiscovery => {
-                    ("retry", "Refresh discovery", ButtonStyle::Secondary)
-                }
-                _ => continue,
-            };
-            let index = nodes.len() as u32;
-            nodes.push(Node {
-                kind: NodeKind::Button(Button {
-                    id: format!("{id}:{}", OWNER.with(|o| o.borrow().generation())),
-                    label: label.into(),
-                    style,
-                }),
-                children: vec![],
-            });
-            nodes[0].children.push(index);
-        }
-        if !view.candidates.is_empty() {
-            let generation = OWNER.with(|o| o.borrow().generation());
-            let index = nodes.len() as u32;
-            nodes.push(Node {
-                kind: NodeKind::Choice(Choice {
-                    id: format!("mat:{generation}"),
-                    label: "Select your Withings sleep mat".into(),
-                    options: view
-                        .candidates
-                        .iter()
-                        .map(|candidate| ChoiceOption {
-                            value: candidate.action_id().into(),
-                            label: candidate.label.clone(),
-                        })
-                        .collect(),
-                    value: None,
-                }),
-                children: vec![],
-            });
-            nodes[0].children.push(index);
-        }
+        let index = nodes.len() as u32;
+        nodes[0].children.push(index);
+        nodes.push(Node {
+            kind: NodeKind::Button(Button {
+                id: format!("retry:{}", OWNER.with(|o| o.borrow().generation())),
+                label: "Refresh discovery".into(),
+                style: ButtonStyle::Secondary,
+            }),
+            children: vec![],
+        });
         Ok(UiTree { nodes })
     }
     fn on_action(
@@ -517,30 +280,16 @@ impl Guest for Plugin {
                 return Err("Setup view is stale; refresh and try again".to_string());
             }
             match (control, value) {
-                ("mat", ActionValue::Chosen(device_id)) => {
-                    // accept() checks that this id belongs to the current authenticated discovery before persisting.
-                    let room = setting("room")?;
-                    let sink = SINK.with(Clone::clone);
-                    sink.set_target(format!("{room}/withings_sleep"));
-                    owner
-                        .accept(&mut HostStore, &device_id, generation, HostStore, sink)
-                        .map_err(|_| "Sleep mat selection could not be saved".to_string())?;
-                    reconcile_owner(&mut owner)?;
-                    Ok("Sleep mat selected and subscriptions reconciled".to_string())
-                }
-                ("retry", ActionValue::Pressed) | ("switch", ActionValue::Pressed) => {
-                    revoke_device()?;
-                    owner.switch_mat();
-                    let mut store = HostStore;
-                    let mut transport = HostTransport;
+                ("retry", ActionValue::Pressed) => {
                     let _ = reconcile_owner(&mut owner);
-                    match owner.discover(&mut transport, &mut store, now()?) {
-                        Ok(_) => Ok("Sleep mat discovery refreshed".to_string()),
-                        Err(error) => {
-                            owner.discovery_failed();
-                            Err(format!("Sleep mat discovery failed: {error}"))
-                        }
-                    }
+                    automatic::discover(&mut owner, account_id()?)?;
+                    let result = reconcile_owner(&mut owner);
+                    automatic::FLEET.with(|f| {
+                        let mut f = f.borrow_mut();
+                        f.ready = result.is_ok() && f.inventory_valid;
+                    });
+                    result?;
+                    Ok("Sleep mats discovered automatically".to_string())
                 }
                 _ => Err("Unsupported setup action".to_string()),
             }
@@ -565,11 +314,13 @@ impl Guest for Plugin {
         person: Option<String>,
     ) -> Result<String, String> {
         OWNER.with(|o| o.borrow_mut().pause());
-        SINK.with(|s| *s.occupancy.borrow_mut() = None);
-        SINK.with(|s| {
-            devices::set_available(&s.target()?, false)
-                .map_err(|_| "Could not revoke availability".to_string())
-        })?;
+        automatic::revoke()?;
+        automatic::FLEET.with(|f| {
+            let mut f = f.borrow_mut();
+            f.account = None;
+            f.inventory_valid = false;
+        });
+
         let expected_account = configured_account()?;
         let cb = withings_client::CallbackUrl::parse(&callback)
             .map_err(|_| "Invalid callback".to_string())?;
@@ -606,13 +357,8 @@ impl Guest for Plugin {
             _ => {}
         }
         activate_saved()?;
-        let selected = OWNER.with(|o| o.borrow().presentation().selected.is_some());
         refresh_panel();
-        Ok(if selected {
-            "Credentials saved, sleep mat activated and subscriptions reconciled. Occupancy remains unknown until a fresh event."
-        } else {
-            "Credentials saved. Open Withings Sleep to select a mat; bed-event delivery is not active yet."
-        }.into())
+        Ok("Credentials saved. Supported sleep mats were discovered automatically; occupancy awaits fresh events.".into())
     }
     fn on_webhook(request: InboundRequest) -> InboundResponse {
         let content_type = request
@@ -646,6 +392,6 @@ impl Guest for Plugin {
     }
     fn stop() {
         OWNER.with(|o| o.borrow_mut().pause());
-        SINK.with(|s| *s.occupancy.borrow_mut() = None);
+        let _ = automatic::revoke();
     }
 }

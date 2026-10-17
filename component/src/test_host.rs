@@ -14,7 +14,9 @@ struct Ledger {
     time: i64,
     fail_final: bool,
     wrong_mat: bool,
-    fail_selection_write: bool,
+    fail_host_write: bool,
+    fail_registration: bool,
+    fail_availability: bool,
     discovery_error: bool,
     empty_inventory: bool,
     multiple_mats: bool,
@@ -73,7 +75,7 @@ pub mod storage {
     pub fn set(k: &str, v: &str) -> Result<(), ()> {
         LEDGER.with(|l| -> Result<(), ()> {
             let mut l = l.borrow_mut();
-            if l.fail_selection_write && k == "selection" {
+            if l.fail_host_write && k == "host_devices" {
                 return Err(());
             }
             l.storage.insert(k.into(), v.into());
@@ -84,10 +86,16 @@ pub mod storage {
 pub mod devices {
     use super::*;
     pub fn upsert(d: &types::Device) -> Result<(), ()> {
+        if LEDGER.with(|l| l.borrow().fail_registration) {
+            return Err(());
+        }
         LEDGER.with(|l| l.borrow_mut().registered.push(d.id.clone()));
         Ok(())
     }
     pub fn set_available(id: &str, value: bool) -> Result<(), ()> {
+        if LEDGER.with(|l| l.borrow().fail_availability) {
+            return Err(());
+        }
         LEDGER.with(|l| {
             let mut l = l.borrow_mut();
             assert!(l.registered.iter().any(|x| x == id));
@@ -184,10 +192,37 @@ pub mod http {
         })
     }
 }
+#[test]
+fn automatic_component_two_mats_no_selection_and_isolated_events() {
+    reset();
+    Plugin::init().unwrap();
+    LEDGER.with(|l| l.borrow_mut().multiple_mats = true);
+    connect().unwrap();
+    automatic::FLEET.with(|f| assert_eq!(f.borrow().sinks.len(), 2));
+    LEDGER.with(|l| assert!(l.borrow().actions.is_empty()));
+    assert_eq!(Plugin::on_webhook(event(50)).status, 200);
+    let first = LEDGER.with(|l| l.borrow().actions[0].0.clone());
+    let mut second = event(50);
+    second.body = String::from_utf8(second.body)
+        .unwrap()
+        .replace("offline-mat", "second-mat")
+        .into_bytes();
+    assert_eq!(Plugin::on_webhook(second).status, 200);
+    LEDGER.with(|l| {
+        let l = l.borrow();
+        assert_eq!(l.actions.len(), 2);
+        assert_ne!(first, l.actions[1].0);
+    });
+    Plugin::stop();
+    Plugin::init().unwrap();
+    assert_eq!(Plugin::on_webhook(event(50)).status, 200);
+    LEDGER.with(|l| assert_eq!(l.borrow().actions.len(), 2));
+}
+
 fn reset() {
+    automatic::FLEET.with(|f| *f.borrow_mut() = automatic::Fleet::default());
     OWNER.with(|o| *o.borrow_mut() = Owner::new());
-    SINK.with(|s| *s.id.borrow_mut() = None);
-    SINK.with(|s| *s.occupancy.borrow_mut() = None);
+
     LEDGER.with(|l| {
         *l.borrow_mut() = Ledger {
             time: 1000,
@@ -217,46 +252,194 @@ fn connect() -> Result<String, String> {
         None,
     )
 }
-fn choose_rendered(index: usize) -> String {
-    let tree = Plugin::render(
-        "withings".into(),
-        RenderContext {
-            room: None,
-            person: None,
-        },
-    )
-    .unwrap();
-    let (control, device) = tree
+#[test]
+fn alpha7_selection_migrates_alias_and_scoped_history_without_replay() {
+    reset();
+    Plugin::init().unwrap();
+    connect().unwrap();
+    let mut legacy = Owner::<HostStore, DeviceSink>::new();
+    legacy.restore(&mut HostStore, 123, now().unwrap()).unwrap();
+    reconcile_owner(&mut legacy).unwrap();
+    legacy
+        .discover(&mut HostTransport, &mut HostStore, now().unwrap())
+        .unwrap();
+    automatic::register("bedroom/withings_sleep").unwrap();
+    let sink = DeviceSink::default();
+    sink.set_target("bedroom/withings_sleep".into());
+    legacy
+        .accept(
+            &mut HostStore,
+            "offline-mat",
+            legacy.generation(),
+            HostStore,
+            sink,
+        )
+        .unwrap();
+    let e = event(50);
+    let request = WebhookRequest {
+        method: e.method,
+        content_type: "application/x-www-form-urlencoded".into(),
+        body: e.body,
+    };
+    assert_eq!(
+        legacy.webhook(&request, now().unwrap(), 86400, 300).status,
+        200
+    );
+    let selection = LEDGER.with(|l| l.borrow().storage["selection"].clone());
+    Plugin::stop();
+    LEDGER.with(|l| l.borrow_mut().multiple_mats = true);
+    Plugin::init().unwrap();
+    assert_eq!(id("offline-mat"), "bedroom/withings_sleep");
+    assert_ne!(id("second-mat"), "bedroom/withings_sleep");
+    assert!(panel().contains("Occupancy unknown"));
+    assert_eq!(Plugin::on_webhook(event(50)).status, 200);
+    LEDGER.with(|l| assert_eq!(l.borrow().actions.len(), 1));
+    LEDGER.with(|l| l.borrow_mut().second_account = true);
+    connect().unwrap();
+    assert_ne!(id("offline-mat"), "bedroom/withings_sleep");
+    assert_eq!(
+        Plugin::on_webhook(other_event(456, "offline-mat", 50)).status,
+        200
+    );
+    LEDGER.with(|l| {
+        let l = l.borrow();
+        assert_eq!(l.actions.len(), 2);
+        assert_eq!(l.storage["selection"], selection);
+    });
+}
+
+#[test]
+fn registration_and_host_inventory_write_failures_are_retryable_without_actions() {
+    for storage_failure in [false, true] {
+        reset();
+        Plugin::init().unwrap();
+        LEDGER.with(|l| {
+            let mut l = l.borrow_mut();
+            l.fail_host_write = storage_failure;
+            l.fail_registration = !storage_failure;
+        });
+        assert!(connect().is_err());
+        assert_eq!(Plugin::on_webhook(event(50)).status, 503);
+        LEDGER.with(|l| {
+            let mut l = l.borrow_mut();
+            assert!(l.actions.is_empty());
+            l.fail_host_write = false;
+            l.fail_registration = false;
+        });
+        retry().unwrap();
+        assert_eq!(Plugin::on_webhook(event(50)).status, 200);
+        LEDGER.with(|l| assert_eq!(l.borrow().actions.len(), 1));
+    }
+}
+#[test]
+fn removed_mat_on_cold_restart_and_failed_retirement_are_fail_closed() {
+    reset();
+    Plugin::init().unwrap();
+    LEDGER.with(|l| l.borrow_mut().multiple_mats = true);
+    connect().unwrap();
+    assert_eq!(
+        Plugin::on_webhook(other_event(123, "second-mat", 50)).status,
+        200
+    );
+    let second = id("second-mat");
+    LEDGER.with(|l| {
+        let mut l = l.borrow_mut();
+        l.multiple_mats = false;
+        l.fail_availability = true;
+    });
+    assert!(retry().is_err());
+    assert_eq!(Plugin::on_webhook(event(50)).status, 503);
+    LEDGER.with(|l| l.borrow_mut().fail_availability = false);
+    retry().unwrap();
+    LEDGER.with(|l| assert_eq!(l.borrow().available.get(&second), Some(&false)));
+    // Simulate losing process memory without calling stop; persisted host IDs must revoke old devices.
+    OWNER.with(|o| *o.borrow_mut() = Owner::new());
+    automatic::FLEET.with(|f| *f.borrow_mut() = automatic::Fleet::default());
+    LEDGER.with(|l| {
+        let mut l = l.borrow_mut();
+        l.available.insert(second.clone(), true);
+        l.secrets.insert("account".into(), "{".into());
+    });
+    Plugin::init().unwrap();
+    LEDGER.with(|l| assert!(l.borrow().available.values().all(|v| !*v)));
+    assert_eq!(Plugin::on_webhook(event(50)).status, 503);
+}
+
+#[test]
+fn changed_invalid_account_record_revokes_running_owner_on_timer() {
+    reset();
+    Plugin::init().unwrap();
+    connect().unwrap();
+    assert_eq!(Plugin::on_webhook(event(50)).status, 200);
+    LEDGER.with(|l| {
+        l.borrow_mut().secrets.insert("account".into(), "{".into());
+    });
+    Plugin::on_timer("lifecycle".into());
+    assert_eq!(Plugin::on_webhook(event(51)).status, 503);
+    LEDGER.with(|l| assert!(l.borrow().available.values().all(|v| !*v)));
+}
+fn context() -> RenderContext {
+    RenderContext {
+        room: None,
+        person: None,
+    }
+}
+fn tree() -> UiTree {
+    Plugin::render("withings".into(), context()).unwrap()
+}
+fn panel() -> String {
+    let t = tree();
+    assert_eq!(t.nodes[0].children.len(), t.nodes.len() - 1);
+    t.nodes
+        .iter()
+        .filter_map(|n| match &n.kind {
+            crate::niles::integration::ui::NodeKind::Text(t) => Some(t.value.clone()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+fn retry_id() -> String {
+    tree()
         .nodes
         .iter()
-        .find_map(|node| match &node.kind {
-            crate::niles::integration::ui::NodeKind::Choice(c) => {
-                Some((c.id.clone(), c.options[index].value.clone()))
+        .find_map(|n| match &n.kind {
+            crate::niles::integration::ui::NodeKind::Button(b) if b.id.starts_with("retry:") => {
+                Some(b.id.clone())
             }
             _ => None,
         })
-        .unwrap();
+        .unwrap()
+}
+fn retry() -> Result<ActionResult, String> {
     Plugin::on_action(
         "withings".into(),
-        control,
-        ActionValue::Chosen(device.clone()),
-        RenderContext {
-            room: None,
-            person: None,
-        },
+        retry_id(),
+        ActionValue::Pressed,
+        context(),
     )
-    .unwrap();
-    device
+}
+fn id(device: &str) -> String {
+    automatic::FLEET.with(|f| f.borrow().sinks[device].target().unwrap())
+}
+fn other_event(account: u64, device: &str, appli: u8) -> InboundRequest {
+    let mut e = event(appli);
+    e.body = String::from_utf8(e.body)
+        .unwrap()
+        .replace("userid=123", &format!("userid={account}"))
+        .replace("offline-mat", device)
+        .into_bytes();
+    e
 }
 #[test]
 fn actual_init_without_credentials_keeps_connect_and_blocks_events() {
     reset();
     Plugin::init().unwrap();
     assert_eq!(Plugin::on_webhook(event(50)).status, 503);
+    assert!(panel().contains("Connect Withings"));
     LEDGER.with(|l| {
         let l = l.borrow();
-        assert_eq!(l.registered, ["bedroom/withings_sleep"]);
-        assert_eq!(l.available.get("bedroom/withings_sleep"), Some(&false));
+        assert!(l.registered.is_empty());
         assert!(l.requests.is_empty());
         assert_eq!(l.timers, ["lifecycle"]);
     });
@@ -266,19 +449,17 @@ fn actual_callback_webhook_restart_and_denial() {
     reset();
     Plugin::init().unwrap();
     connect().unwrap();
-    choose_rendered(0);
+    let device = id("offline-mat");
     assert_eq!(Plugin::on_webhook(event(50)).status, 200);
     LEDGER.with(|l| {
         let l = l.borrow();
-        assert_eq!(
-            l.actions,
-            [("bedroom/withings_sleep".into(), "bed_in".into())]
-        );
+        assert_eq!(l.actions, [(device.clone(), "bed_in".into())]);
         assert!(l.readings.contains(&("in_bed".into(), 1.0)));
-        assert_eq!(l.available.get("bedroom/withings_sleep"), Some(&true));
+        assert_eq!(l.available.get(&device), Some(&true));
     });
     Plugin::stop();
     Plugin::init().unwrap();
+    assert!(panel().contains("Occupancy unknown"));
     assert_eq!(Plugin::on_webhook(event(50)).status, 200);
     LEDGER.with(|l| assert_eq!(l.borrow().actions.len(), 1));
     Plugin::on_callback(
@@ -288,34 +469,51 @@ fn actual_callback_webhook_restart_and_denial() {
     )
     .unwrap();
     assert_eq!(Plugin::on_webhook(event(51)).status, 503);
-    LEDGER.with(|l| {
-        assert_eq!(
-            l.borrow().available.get("bedroom/withings_sleep"),
-            Some(&false)
-        )
-    });
+    Plugin::on_timer("lifecycle".into());
+    assert_eq!(Plugin::on_webhook(event(51)).status, 503);
+    LEDGER.with(|l| assert_eq!(l.borrow().available.get(&device), Some(&false)));
 }
 #[test]
-fn account_onboarding_without_user_setting_selects_and_restores_mat() {
+fn account_onboarding_automatic_without_manual_settings() {
     reset();
     Plugin::init().unwrap();
-    assert!(connect().unwrap().contains("select a mat"));
-    let selected = choose_rendered(0);
-    assert_eq!(selected, "offline-mat");
+    assert!(connect().unwrap().contains("automatically"));
+    assert_eq!(automatic::FLEET.with(|f| f.borrow().sinks.len()), 1);
+    assert!(
+        tree()
+            .nodes
+            .iter()
+            .all(|n| !matches!(n.kind, crate::niles::integration::ui::NodeKind::Choice(_)))
+    );
+    LEDGER.with(|l| assert!(l.borrow().actions.is_empty()));
     assert_eq!(Plugin::on_webhook(event(50)).status, 200);
+    let original = id("offline-mat");
     Plugin::stop();
     Plugin::init().unwrap();
-    assert!(panel().contains("Configured sleep mat selected"));
+    assert_eq!(id("offline-mat"), original);
     assert_eq!(Plugin::on_webhook(event(50)).status, 200);
     LEDGER.with(|l| assert_eq!(l.borrow().actions.len(), 1));
 }
 #[test]
-fn malformed_pending_and_account_switch_do_not_reuse_saved_mat_or_deliver() {
+fn corrupt_account_and_corrupt_legacy_selection_fail_closed() {
     reset();
     Plugin::init().unwrap();
     connect().unwrap();
-    choose_rendered(0);
-    LEDGER.with(|l| l.borrow_mut().secrets.insert("account".into(), "{".into()));
+    LEDGER.with(|l| {
+        l.borrow_mut()
+            .storage
+            .insert("selection".into(), "{".into());
+    });
+    assert!(retry().is_err());
+    assert_eq!(Plugin::on_webhook(event(50)).status, 503);
+    LEDGER.with(|l| {
+        l.borrow_mut().storage.remove("selection");
+    });
+    retry().unwrap();
+    assert_eq!(Plugin::on_webhook(event(50)).status, 200);
+    LEDGER.with(|l| {
+        l.borrow_mut().secrets.insert("account".into(), "{".into());
+    });
     Plugin::stop();
     Plugin::init().unwrap();
     assert_eq!(Plugin::on_webhook(event(50)).status, 503);
@@ -324,7 +522,9 @@ fn malformed_pending_and_account_switch_do_not_reuse_saved_mat_or_deliver() {
 fn timer_rotation_final_save_failure_revokes_and_restart_refuses() {
     reset();
     Plugin::init().unwrap();
+    LEDGER.with(|l| l.borrow_mut().multiple_mats = true);
     connect().unwrap();
+    assert_eq!(Plugin::on_webhook(event(50)).status, 200);
     LEDGER.with(|l| {
         let mut l = l.borrow_mut();
         l.time = 4601;
@@ -342,235 +542,81 @@ fn timer_rotation_final_save_failure_revokes_and_restart_refuses() {
                 .count(),
             1
         );
+        assert!(l.available.values().all(|v| !*v));
     });
     Plugin::stop();
     Plugin::init().unwrap();
     assert_eq!(Plugin::on_webhook(event(50)).status, 503);
 }
 #[test]
-fn interactive_choice_uses_actual_rendered_control_and_persists_then_delivers() {
+fn rendered_retry_retains_fresh_state_and_stale_control_is_rejected() {
     reset();
     Plugin::init().unwrap();
     connect().unwrap();
-    let tree = Plugin::render(
-        "withings".into(),
-        RenderContext {
-            room: None,
-            person: None,
-        },
-    )
-    .unwrap();
-    let (control, candidate) = tree
-        .nodes
-        .iter()
-        .find_map(|node| match &node.kind {
-            crate::niles::integration::ui::NodeKind::Choice(c) => {
-                Some((c.id.clone(), c.options[0].value.clone()))
-            }
-            _ => None,
-        })
-        .expect("render includes candidate selection");
-    assert!(
-        Plugin::on_action(
-            "withings".into(),
-            control,
-            ActionValue::Chosen(candidate),
-            RenderContext {
-                room: None,
-                person: None
-            }
-        )
-        .unwrap()
-        .rerender
-    );
     assert_eq!(Plugin::on_webhook(event(50)).status, 200);
-    Plugin::stop();
-    Plugin::init().unwrap();
-    assert_eq!(Plugin::on_webhook(event(50)).status, 200);
-}
-#[test]
-fn stale_rendered_choice_and_failed_storage_never_activate() {
-    reset();
-    Plugin::init().unwrap();
+    assert!(retry().unwrap().rerender);
+    assert!(panel().contains("In bed"));
+    let stale = retry_id();
     connect().unwrap();
-    let tree = Plugin::render(
-        "withings".into(),
-        RenderContext {
-            room: None,
-            person: None,
-        },
-    )
-    .unwrap();
-    let (control, candidate) = tree
-        .nodes
-        .iter()
-        .find_map(|node| match &node.kind {
-            crate::niles::integration::ui::NodeKind::Choice(c) => {
-                Some((c.id.clone(), c.options[0].value.clone()))
-            }
-            _ => None,
-        })
-        .unwrap();
-    let generation = control.rsplit(':').next().unwrap();
-    Plugin::on_action(
-        "withings".into(),
-        format!("switch:{generation}"),
-        ActionValue::Pressed,
-        RenderContext {
-            room: None,
-            person: None,
-        },
-    )
-    .unwrap();
-    assert!(
-        Plugin::on_action(
-            "withings".into(),
-            control.clone(),
-            ActionValue::Chosen(candidate.clone()),
-            RenderContext {
-                room: None,
-                person: None
-            }
-        )
-        .is_err()
-    );
-    assert_eq!(Plugin::on_webhook(event(50)).status, 503);
-    LEDGER.with(|l| l.borrow_mut().fail_selection_write = true);
-    let tree = Plugin::render(
-        "withings".into(),
-        RenderContext {
-            room: None,
-            person: None,
-        },
-    )
-    .unwrap();
-    let (control, candidate) = tree
-        .nodes
-        .iter()
-        .find_map(|node| match &node.kind {
-            crate::niles::integration::ui::NodeKind::Choice(c) => {
-                Some((c.id.clone(), c.options[0].value.clone()))
-            }
-            _ => None,
-        })
-        .unwrap();
-    assert!(
-        Plugin::on_action(
-            "withings".into(),
-            control,
-            ActionValue::Chosen(candidate),
-            RenderContext {
-                room: None,
-                person: None
-            }
-        )
-        .is_err()
-    );
-    assert_eq!(Plugin::on_webhook(event(50)).status, 503);
+    assert!(Plugin::on_action("withings".into(), stale, ActionValue::Pressed, context()).is_err());
+    LEDGER.with(|l| assert_eq!(l.borrow().actions.len(), 1));
 }
 #[test]
-fn retry_distinguishes_empty_and_failed_discovery() {
+fn retry_distinguishes_empty_and_failed_discovery_and_recovers() {
     reset();
     Plugin::init().unwrap();
     LEDGER.with(|l| l.borrow_mut().empty_inventory = true);
     connect().unwrap();
-    let tree = Plugin::render(
-        "withings".into(),
-        RenderContext {
-            room: None,
-            person: None,
-        },
-    )
-    .unwrap();
-    assert!(tree.nodes.iter().any(|n| matches!(&n.kind, crate::niles::integration::ui::NodeKind::Text(t) if t.value.contains("No supported"))));
-    let retry = tree
-        .nodes
-        .iter()
-        .find_map(|n| match &n.kind {
-            crate::niles::integration::ui::NodeKind::Button(b) if b.id.starts_with("retry:") => {
-                Some(b.id.clone())
-            }
-            _ => None,
-        })
-        .unwrap();
+    assert!(panel().contains("0 supported sleep mats"));
     LEDGER.with(|l| {
         let mut l = l.borrow_mut();
         l.empty_inventory = false;
         l.discovery_error = true;
     });
-    Plugin::on_action(
-        "withings".into(),
-        retry,
-        ActionValue::Pressed,
-        RenderContext {
-            room: None,
-            person: None,
-        },
-    )
-    .unwrap_err();
-    assert!(panel().contains("discovery is unavailable"));
+    assert!(retry().is_err());
+    assert!(panel().contains("Device discovery failed"));
     assert_eq!(Plugin::on_webhook(event(50)).status, 503);
+    LEDGER.with(|l| l.borrow_mut().discovery_error = false);
+    retry().unwrap();
+    assert_eq!(Plugin::on_webhook(event(50)).status, 200);
 }
 #[test]
-fn multiple_candidates_are_rendered_and_selected_explicitly() {
+fn multiple_mats_second_mat_entry_duplicate_exit_and_removal() {
     reset();
     Plugin::init().unwrap();
     LEDGER.with(|l| l.borrow_mut().multiple_mats = true);
     connect().unwrap();
-    let tree = Plugin::render(
-        "withings".into(),
-        RenderContext {
-            room: None,
-            person: None,
-        },
-    )
-    .unwrap();
-    let choice = tree
-        .nodes
-        .iter()
-        .find_map(|n| match &n.kind {
-            crate::niles::integration::ui::NodeKind::Choice(c) => Some(c),
-            _ => None,
-        })
-        .unwrap();
-    assert_eq!(choice.options.len(), 2);
-    let selected = choose_rendered(1);
-    let mut bed_in = event(50);
-    bed_in.body = String::from_utf8(bed_in.body)
-        .unwrap()
-        .replace("offline-mat", &selected)
-        .into_bytes();
-    assert_eq!(Plugin::on_webhook(bed_in.clone()).status, 200);
-    assert_eq!(Plugin::on_webhook(bed_in).status, 200);
-    LEDGER.with(|l| assert_eq!(l.borrow().actions.len(), 1));
+    let second = id("second-mat");
+    assert_eq!(
+        Plugin::on_webhook(other_event(123, "second-mat", 50)).status,
+        200
+    );
+    assert_eq!(
+        Plugin::on_webhook(other_event(123, "second-mat", 50)).status,
+        200
+    );
     LEDGER.with(|l| l.borrow_mut().time += 1);
-    let mut bed_out = event(51);
-    bed_out.body = String::from_utf8(bed_out.body)
-        .unwrap()
-        .replace("offline-mat", &selected)
-        .into_bytes();
-    assert_eq!(Plugin::on_webhook(bed_out).status, 200);
+    assert_eq!(
+        Plugin::on_webhook(other_event(123, "second-mat", 51)).status,
+        200
+    );
     LEDGER.with(|l| {
         assert_eq!(
             l.borrow().actions,
             [
-                ("bedroom/withings_sleep".into(), "bed_in".into()),
-                ("bedroom/withings_sleep".into(), "bed_out".into()),
+                (second.clone(), "bed_in".into()),
+                (second.clone(), "bed_out".into())
             ]
-        )
+        );
+        l.borrow_mut().multiple_mats = false;
     });
-}
-#[test]
-fn legacy_configured_mat_activates_once_and_callback_is_truthful() {
-    reset();
-    LEDGER.with(|l| l.borrow_mut().legacy_id = true);
-    Plugin::init().unwrap();
-    assert!(connect().unwrap().contains("sleep mat activated"));
+    retry().unwrap();
+    assert_ne!(
+        Plugin::on_webhook(other_event(123, "second-mat", 50)).status,
+        200
+    );
+    LEDGER.with(|l| assert_eq!(l.borrow().available.get(&second), Some(&false)));
     assert_eq!(Plugin::on_webhook(event(50)).status, 200);
-    reset();
-    Plugin::init().unwrap();
-    assert!(connect().unwrap().contains("select a mat"));
-    assert_eq!(Plugin::on_webhook(event(50)).status, 503);
 }
 #[test]
 fn account_restrictions_and_damaged_records_fail_closed() {
@@ -579,12 +625,12 @@ fn account_restrictions_and_damaged_records_fail_closed() {
         Plugin::init().unwrap();
         LEDGER.with(|l| l.borrow_mut().configured_user = Some(expected.into()));
         assert!(connect().is_err());
+        Plugin::on_timer("lifecycle".into());
         assert_eq!(Plugin::on_webhook(event(50)).status, 503);
     }
     reset();
     Plugin::init().unwrap();
     connect().unwrap();
-    choose_rendered(0);
     let valid = LEDGER.with(|l| l.borrow().secrets["account"].clone());
     for damaged in [
         "{".to_string(),
@@ -598,28 +644,38 @@ fn account_restrictions_and_damaged_records_fail_closed() {
         Plugin::init().unwrap();
         assert_eq!(Plugin::on_webhook(event(50)).status, 503);
         assert_eq!(LEDGER.with(|l| l.borrow().requests.len()), before);
-        assert!(panel().contains("Reconnect Withings"));
     }
 }
 #[test]
-fn replacement_account_does_not_inherit_mat_or_old_events() {
+fn replacement_account_has_independent_identity_history_and_restart() {
     reset();
     Plugin::init().unwrap();
     connect().unwrap();
-    choose_rendered(0);
+    let old = id("offline-mat");
     assert_eq!(Plugin::on_webhook(event(50)).status, 200);
-    let saved = LEDGER.with(|l| l.borrow().storage["selection"].clone());
     LEDGER.with(|l| l.borrow_mut().second_account = true);
-    let _ = connect(); // Foreign persisted selection may explicitly block setup.
-    assert_eq!(Plugin::on_webhook(event(50)).status, 503);
-    assert!(OWNER.with(|o| o.borrow().presentation().selected.is_none()));
+    connect().unwrap();
+    let new = id("offline-mat");
+    assert_ne!(old, new);
+    assert_ne!(Plugin::on_webhook(event(50)).status, 200);
     assert_eq!(
-        LEDGER.with(|l| l.borrow().storage["selection"].clone()),
-        saved
+        Plugin::on_webhook(other_event(456, "offline-mat", 50)).status,
+        200
     );
+    LEDGER.with(|l| {
+        let l = l.borrow();
+        assert_eq!(l.actions.len(), 2);
+        assert_eq!(l.available.get(&old), Some(&false));
+    });
     Plugin::stop();
     Plugin::init().unwrap();
-    assert_eq!(Plugin::on_webhook(event(50)).status, 503);
+    assert_eq!(id("offline-mat"), new);
+    assert_ne!(Plugin::on_webhook(event(50)).status, 200);
+    assert_eq!(
+        Plugin::on_webhook(other_event(456, "offline-mat", 50)).status,
+        200
+    );
+    LEDGER.with(|l| assert_eq!(l.borrow().actions.len(), 2));
 }
 #[test]
 fn subscription_failure_recovers_on_timer_without_reconnecting() {
@@ -628,61 +684,19 @@ fn subscription_failure_recovers_on_timer_without_reconnecting() {
     LEDGER.with(|l| l.borrow_mut().subscription_error = true);
     assert!(connect().is_err());
     assert_eq!(Plugin::on_webhook(event(50)).status, 503);
+    assert!(!panel().contains("subscriptions ready"));
     LEDGER.with(|l| l.borrow_mut().subscription_error = false);
     Plugin::on_timer("lifecycle".into());
-    choose_rendered(0);
     assert_eq!(Plugin::on_webhook(event(50)).status, 200);
     assert!(panel().contains("subscriptions ready"));
-}
-#[test]
-fn replacement_account_explicit_retry_selects_without_old_event_delivery() {
-    reset();
-    Plugin::init().unwrap();
-    connect().unwrap();
-    choose_rendered(0);
-    LEDGER.with(|l| l.borrow_mut().second_account = true);
-    let _ = connect();
-    // The new account offers its own rendered choice, never the saved binding.
-    assert!(OWNER.with(|o| o.borrow().presentation().selected.is_none()));
-    choose_rendered(0);
-    assert_ne!(Plugin::on_webhook(event(50)).status, 200);
-    let mut current = event(50);
-    current.body = String::from_utf8(current.body)
-        .unwrap()
-        .replace("userid=123", "userid=456")
-        .into_bytes();
-    assert_eq!(Plugin::on_webhook(current).status, 200);
-    Plugin::stop();
-    Plugin::init().unwrap();
-    assert_ne!(Plugin::on_webhook(event(50)).status, 200);
-}
-fn panel() -> String {
-    let tree = Plugin::render(
-        "withings".into(),
-        RenderContext {
-            room: None,
-            person: None,
-        },
-    )
-    .unwrap();
-    assert_eq!(tree.nodes[0].children.len(), tree.nodes.len() - 1);
-    tree.nodes
-        .iter()
-        .filter_map(|n| match &n.kind {
-            crate::niles::integration::ui::NodeKind::Text(t) => Some(t.value.clone()),
-            _ => None,
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
 }
 #[test]
 fn panel_tracks_fresh_events_and_recovery_without_exposing_identifiers() {
     reset();
     Plugin::init().unwrap();
     assert!(panel().contains("Connect Withings"));
-    assert!(panel().contains("Occupancy unknown"));
     connect().unwrap();
-    choose_rendered(0);
+    assert!(panel().contains("Occupancy unknown"));
     assert!(panel().contains("subscriptions ready"));
     assert!(!panel().contains("offline-mat"));
     assert_eq!(Plugin::on_webhook(event(50)).status, 200);
