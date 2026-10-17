@@ -17,6 +17,10 @@ struct Ledger {
     fail_host_write: bool,
     fail_registration: bool,
     fail_availability: bool,
+    fail_action: bool,
+    fail_diagnostics: bool,
+    fail_presence: bool,
+    diagnostic_writes: usize,
     discovery_error: bool,
     empty_inventory: bool,
     multiple_mats: bool,
@@ -70,11 +74,43 @@ pub mod storage {
     pub fn set(k: &str, v: &str) -> Result<(), ()> {
         LEDGER.with(|l| -> Result<(), ()> {
             let mut l = l.borrow_mut();
-            if l.fail_host_write && k == "host_devices" {
+            if k.starts_with("diag/") {
+                l.diagnostic_writes += 1;
+            }
+            if (l.fail_presence && k.starts_with("niles-withings:presence:"))
+                || (l.fail_diagnostics && k.starts_with("diag/"))
+                || (l.fail_host_write && k == "host_devices")
+            {
+                return Err(());
+            }
+            let projected = l
+                .storage
+                .iter()
+                .filter(|(key, _)| key.as_str() != k)
+                .map(|(key, value)| key.len() + value.len())
+                .sum::<usize>()
+                + k.len()
+                + v.len();
+            if projected > 1_048_576 {
                 return Err(());
             }
             l.storage.insert(k.into(), v.into());
             Ok(())
+        })
+    }
+    pub fn delete(k: &str) {
+        LEDGER.with(|l| {
+            l.borrow_mut().storage.remove(k);
+        });
+    }
+    pub fn list_keys(prefix: &str) -> Vec<String> {
+        LEDGER.with(|l| {
+            l.borrow()
+                .storage
+                .keys()
+                .filter(|k| k.starts_with(prefix))
+                .cloned()
+                .collect()
         })
     }
 }
@@ -109,6 +145,9 @@ pub mod devices {
         Ok(())
     }
     pub fn report_action(id: &str, a: &str) -> Result<(), ()> {
+        if LEDGER.with(|l| l.borrow().fail_action) {
+            return Err(());
+        }
         LEDGER.with(|l| l.borrow_mut().actions.push((id.into(), a.into())));
         Ok(())
     }
@@ -468,6 +507,373 @@ fn actual_callback_webhook_restart_and_denial() {
     assert_eq!(Plugin::on_webhook(event(51)).status, 503);
     LEDGER.with(|l| assert_eq!(l.borrow().available.get(&device), Some(&false)));
 }
+
+#[test]
+fn diagnostics_follow_actual_callback_webhook_duplicate_and_restart() {
+    reset();
+    Plugin::init().unwrap();
+    connect().unwrap();
+    assert_eq!(Plugin::on_webhook(event(50)).status, 200);
+    assert_eq!(Plugin::on_webhook(event(50)).status, 200);
+    let first: serde_json::Value = serde_json::from_str(
+        &Plugin::call_tool(
+            "withings_diagnostics_export".into(),
+            r#"{"page":0,"per_page":100}"#.into(),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let records = first["records"].as_array().unwrap();
+    assert!(records.iter().any(|r| r["event"] == "callback"));
+    assert!(records.iter().any(|r| r["event"] == "bed_in"
+        && r["stage"] == "decision"
+        && r["outcome"] == "transition"));
+    assert!(records.iter().any(|r| r["event"] == "bed_in"
+        && r["stage"] == "decision"
+        && r["outcome"] == "duplicate_or_stale"));
+    let first_correlation = records
+        .iter()
+        .find(|r| r["event"] == "bed_in" && r["stage"] == "receipt")
+        .unwrap()["correlation"]
+        .clone();
+    assert!(records.iter().any(|r| r["event"] == "bed_in"
+        && r["stage"] == "publication"
+        && r["correlation"] == first_correlation));
+    assert!(!first.to_string().contains("fixture-secret"));
+    // Recreate volatile owners without clearing the same host storage.
+    OWNER.with(|o| *o.borrow_mut() = Owner::new());
+    automatic::FLEET.with(|f| *f.borrow_mut() = automatic::Fleet::default());
+    Plugin::init().unwrap();
+    let after = Plugin::call_tool(
+        "withings_diagnostics_export".into(),
+        r#"{"page":0,"per_page":100}"#.into(),
+    )
+    .unwrap();
+    assert!(after.contains("bed_in"));
+    assert_eq!(Plugin::on_webhook(event(50)).status, 200);
+    LEDGER.with(|l| assert_eq!(l.borrow().actions.len(), 1));
+}
+
+fn diagnostic_records() -> Vec<serde_json::Value> {
+    let value: serde_json::Value = serde_json::from_str(
+        &Plugin::call_tool(
+            "withings_diagnostics_export".into(),
+            r#"{"page":0,"per_page":100}"#.into(),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    value["records"].as_array().unwrap().clone()
+}
+
+#[test]
+fn diagnostics_observe_actual_results_two_mats_and_restart() {
+    reset();
+    LEDGER.with(|l| {
+        let mut l = l.borrow_mut();
+        l.time = 1_792_200_000;
+        l.multiple_mats = true;
+    });
+    Plugin::init().unwrap();
+    connect().unwrap();
+    let request = event(50);
+    assert_eq!(Plugin::on_webhook(event(50)).status, 200);
+    assert_eq!(Plugin::on_webhook(event(50)).status, 200);
+    let mut other = event(50);
+    other.body = String::from_utf8(other.body)
+        .unwrap()
+        .replace("offline-mat", "second-mat")
+        .into_bytes();
+    assert_eq!(Plugin::on_webhook(other).status, 200);
+    OWNER.with(|o| *o.borrow_mut() = Owner::new());
+    automatic::FLEET.with(|f| *f.borrow_mut() = automatic::Fleet::default());
+    Plugin::init().unwrap();
+    assert_eq!(Plugin::on_webhook(request).status, 200);
+    let records = diagnostic_records();
+    let published: Vec<_> = records
+        .iter()
+        .filter(|r| r["outcome"] == "action_published")
+        .collect();
+    assert_eq!(published.len(), 2);
+    assert_ne!(published[0]["mat"], published[1]["mat"]);
+    assert_eq!(
+        records
+            .iter()
+            .filter(|r| r["outcome"] == "no_action")
+            .count(),
+        2
+    );
+    assert_eq!(
+        records
+            .iter()
+            .filter(|r| r["outcome"] == "duplicate_or_stale")
+            .count(),
+        2
+    );
+    let receipts: Vec<_> = records
+        .iter()
+        .filter(|r| r["event"] == "bed_in" && r["stage"] == "receipt")
+        .collect();
+    assert_eq!(receipts.len(), 4);
+    let correlations: std::collections::BTreeSet<_> = receipts
+        .iter()
+        .map(|r| r["correlation"].as_u64().unwrap())
+        .collect();
+    assert_eq!(correlations.len(), 4);
+    for receipt in receipts {
+        assert!(receipt["mat"].as_str().unwrap().starts_with("mat_"));
+        assert_eq!(receipt["provider_at"], 1_792_200_000i64);
+        assert_eq!(
+            records
+                .iter()
+                .filter(|r| r["correlation"] == receipt["correlation"] && r["event"] == "bed_in")
+                .count(),
+            3
+        );
+    }
+    LEDGER.with(|l| assert_eq!(l.borrow().actions.len(), published.len()));
+    let text = serde_json::to_string(&records).unwrap();
+    for forbidden in [
+        "fixture-secret",
+        "fixture-access",
+        "fixture-refresh",
+        "offline-mat",
+        "second-mat",
+        "example.org",
+    ] {
+        assert!(!text.contains(forbidden));
+    }
+}
+
+#[test]
+fn diagnostics_action_failure_is_not_publication_and_retry_is_silent() {
+    reset();
+    Plugin::init().unwrap();
+    connect().unwrap();
+    LEDGER.with(|l| l.borrow_mut().fail_action = true);
+    assert_ne!(Plugin::on_webhook(event(50)).status, 200);
+    LEDGER.with(|l| l.borrow_mut().fail_action = false);
+    assert_eq!(Plugin::on_webhook(event(50)).status, 200);
+    let records = diagnostic_records();
+    assert_eq!(
+        records
+            .iter()
+            .filter(|r| r["outcome"] == "action_failed")
+            .count(),
+        1
+    );
+    assert_eq!(
+        records
+            .iter()
+            .filter(|r| r["outcome"] == "action_published")
+            .count(),
+        0
+    );
+    assert_eq!(
+        records
+            .iter()
+            .filter(|r| r["outcome"] == "no_action")
+            .count(),
+        1
+    );
+    LEDGER.with(|l| assert!(l.borrow().actions.is_empty()));
+}
+
+#[test]
+fn diagnostics_reading_failure_and_storage_failure_cannot_claim_action() {
+    reset();
+    Plugin::init().unwrap();
+    connect().unwrap();
+    LEDGER.with(|l| l.borrow_mut().fail_availability = true);
+    assert_ne!(Plugin::on_webhook(event(50)).status, 200);
+    assert!(
+        diagnostic_records()
+            .iter()
+            .any(|r| r["outcome"] == "reading_failed")
+    );
+    LEDGER.with(|l| {
+        let mut l = l.borrow_mut();
+        l.fail_availability = false;
+        l.fail_diagnostics = true;
+        l.time += 1;
+    });
+    assert_eq!(Plugin::on_webhook(event(51)).status, 200);
+    LEDGER.with(|l| assert_eq!(l.borrow().actions.len(), 1));
+    LEDGER.with(|l| l.borrow_mut().fail_diagnostics = false);
+    assert_eq!(Plugin::on_webhook(event(51)).status, 200);
+    LEDGER.with(|l| assert_eq!(l.borrow().actions.len(), 1));
+}
+
+#[test]
+fn diagnostics_health_is_hourly_and_reports_failure_recovery() {
+    reset();
+    Plugin::init().unwrap();
+    connect().unwrap();
+    let before = diagnostic_records().len();
+    for _ in 0..11 {
+        LEDGER.with(|l| l.borrow_mut().time += 300);
+        Plugin::on_timer("lifecycle".into());
+    }
+    assert_eq!(diagnostic_records().len(), before);
+    LEDGER.with(|l| l.borrow_mut().time += 300);
+    Plugin::on_timer("lifecycle".into());
+    assert_eq!(diagnostic_records().len(), before + 1);
+    LEDGER.with(|l| l.borrow_mut().subscription_error = true);
+    Plugin::on_timer("lifecycle".into());
+    assert_eq!(
+        diagnostic_records().last().unwrap()["outcome"],
+        "subscription_failed"
+    );
+    LEDGER.with(|l| l.borrow_mut().subscription_error = false);
+    Plugin::on_timer("lifecycle".into());
+    assert_eq!(diagnostic_records().last().unwrap()["outcome"], "ready");
+}
+
+#[test]
+fn diagnostics_malformed_flood_has_bounded_writes_and_honest_summary() {
+    for fail in [false, true] {
+        reset();
+        Plugin::init().unwrap();
+        connect().unwrap();
+        LEDGER.with(|l| l.borrow_mut().fail_diagnostics = fail);
+        let before = LEDGER.with(|l| l.borrow().diagnostic_writes);
+        for _ in 0..10_000 {
+            let mut bad = event(50);
+            bad.body = b"private-invalid-payload".to_vec();
+            assert_ne!(Plugin::on_webhook(bad).status, 200);
+        }
+        let writes = LEDGER.with(|l| l.borrow().diagnostic_writes) - before;
+        assert!(writes <= 12, "{writes} writes during flood");
+        let export: serde_json::Value = serde_json::from_str(
+            &Plugin::call_tool("withings_diagnostics_export".into(), "{}".into()).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(export["pending_suppressed_requests"], 9999);
+        assert_eq!(export["complete"], false);
+        assert!(!export.to_string().contains("private-invalid-payload"));
+        LEDGER.with(|l| {
+            let mut l = l.borrow_mut();
+            l.fail_diagnostics = false;
+            l.time += 60;
+        });
+        Plugin::on_timer("lifecycle".into());
+        let exported: serde_json::Value = serde_json::from_str(
+            &Plugin::call_tool("withings_diagnostics_export".into(), "{}".into()).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(exported["suppression_count"], 9999);
+        assert_eq!(exported["pending_suppressed_requests"], 0);
+        if fail {
+            assert!(exported["write_failure_count"].as_u64().unwrap() > 0);
+        }
+        LEDGER.with(|l| assert!(l.borrow().actions.is_empty()));
+    }
+}
+
+#[test]
+fn diagnostics_quota_pressure_reclaims_only_journal_before_real_delivery() {
+    reset();
+    Plugin::init().unwrap();
+    connect().unwrap();
+    for _ in 0..1000 {
+        journal(now().unwrap(), "lifecycle", "reconcile", "ready").unwrap();
+    }
+    let bytes = LEDGER.with(|l| {
+        l.borrow()
+            .storage
+            .iter()
+            .map(|(k, v)| k.len() + v.len())
+            .sum::<usize>()
+    });
+    let pad = "p".repeat(1_048_576 - bytes - "unrelated".len() - 32);
+    storage::set("unrelated", &pad).unwrap();
+    let secrets_before = LEDGER.with(|l| l.borrow().secrets.clone());
+    assert_eq!(Plugin::on_webhook(event(50)).status, 200);
+    LEDGER.with(|l| {
+        let l = l.borrow();
+        assert_eq!(l.actions.len(), 1);
+        assert_eq!(l.storage["unrelated"], pad);
+        assert_eq!(l.secrets, secrets_before);
+        assert!(
+            l.storage
+                .iter()
+                .map(|(k, v)| k.len() + v.len())
+                .sum::<usize>()
+                <= 1_048_576
+        );
+    });
+    let e: serde_json::Value = serde_json::from_str(
+        &Plugin::call_tool("withings_diagnostics_export".into(), "{}".into()).unwrap(),
+    )
+    .unwrap();
+    assert!(e["truncation_count"].as_u64().unwrap() >= 1000);
+    assert_eq!(e["complete"], false);
+    assert_eq!(Plugin::on_webhook(event(50)).status, 200);
+    LEDGER.with(|l| assert_eq!(l.borrow().actions.len(), 1));
+}
+
+#[test]
+fn diagnostics_presence_failure_has_no_action_and_recovers_without_reclaim() {
+    reset();
+    Plugin::init().unwrap();
+    connect().unwrap();
+    let retained = diagnostic_records().len();
+    LEDGER.with(|l| l.borrow_mut().fail_presence = true);
+    assert_ne!(Plugin::on_webhook(event(50)).status, 200);
+    let records = diagnostic_records();
+    assert_eq!(records.len(), retained + 3);
+    assert!(
+        records
+            .iter()
+            .any(|r| r["stage"] == "persistence" && r["outcome"] == "failed")
+    );
+    LEDGER.with(|l| assert!(l.borrow().actions.is_empty()));
+    LEDGER.with(|l| l.borrow_mut().fail_presence = false);
+    assert_eq!(Plugin::on_webhook(event(50)).status, 200);
+    LEDGER.with(|l| assert_eq!(l.borrow().actions.len(), 1));
+    assert_eq!(
+        diagnostic_records()
+            .iter()
+            .filter(|r| r["outcome"] == "action_published")
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn diagnostics_tool_is_strict_read_only_and_invalidates_stale_pages() {
+    reset();
+    Plugin::init().unwrap();
+    connect().unwrap();
+    let before = LEDGER.with(|l| l.borrow().storage.clone());
+    let first: serde_json::Value = serde_json::from_str(
+        &Plugin::call_tool(
+            "withings_diagnostics_export".into(),
+            r#"{"per_page":1}"#.into(),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let args = serde_json::json!({"page":1,"per_page":1,"snapshot":first["snapshot"]}).to_string();
+    Plugin::call_tool("withings_diagnostics_export".into(), args.clone()).unwrap();
+    LEDGER.with(|l| assert_eq!(l.borrow().storage, before));
+    for args in [
+        r#"{"page":1}"#,
+        r#"{"per_page":101}"#,
+        r#"{"page":-1}"#,
+        r#"{"page":"0"}"#,
+        r#"{"secret":"no"}"#,
+    ] {
+        assert!(Plugin::call_tool("withings_diagnostics_export".into(), args.into()).is_err());
+    }
+    assert_eq!(Plugin::on_webhook(event(50)).status, 200);
+    assert!(
+        Plugin::call_tool("withings_diagnostics_export".into(), args)
+            .unwrap_err()
+            .contains("restart export")
+    );
+}
+
 #[test]
 fn account_onboarding_automatic_without_manual_settings() {
     reset();

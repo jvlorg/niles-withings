@@ -1,5 +1,25 @@
 //! Niles imports: encrypted account storage, scoped persistence, per-device publication and HTTP.
 use super::*;
+impl niles_withings::diagnostics::Backend for HostStore {
+    type Error = String;
+    fn get(&mut self, key: &str) -> Result<Option<String>, String> {
+        Self::get(key)
+    }
+    fn set(&mut self, key: &str, value: &str) -> Result<(), String> {
+        Self::set(key, value)
+    }
+    fn delete(&mut self, key: &str) -> Result<(), String> {
+        storage::delete(key);
+        if storage::get(key).is_some() {
+            Err("Diagnostic deletion failed".into())
+        } else {
+            Ok(())
+        }
+    }
+    fn list(&mut self, prefix: &str) -> Result<Vec<String>, String> {
+        Ok(storage::list_keys(prefix))
+    }
+}
 
 #[derive(Clone)]
 pub(super) struct HostStore;
@@ -8,7 +28,24 @@ impl HostStore {
         Ok(storage::get(key))
     }
     pub(super) fn set(key: &str, value: &str) -> Result<(), String> {
-        storage::set(key, value).map_err(|_| "Host storage write failed".to_string())
+        if storage::set(key, value).is_ok() {
+            return Ok(());
+        }
+        // Never reclaim evidence for a generic/transient storage failure. Confirm
+        // the same key+value quota calculation used by the pinned Niles store.
+        if !key.starts_with(niles_withings::diagnostics::PREFIX) {
+            let others: usize = storage::list_keys("")
+                .into_iter()
+                .filter(|k| k != key)
+                .filter_map(|k| storage::get(&k).map(|v| k.len().saturating_add(v.len())))
+                .sum();
+            if others.saturating_add(key.len()).saturating_add(value.len()) > 1_048_576 {
+                let _ = niles_withings::diagnostics::reclaim(&mut HostStore);
+                return storage::set(key, value)
+                    .map_err(|_| "Host storage write failed".to_string());
+            }
+        }
+        Err("Host storage write failed".to_string())
     }
 }
 impl AccountSecretStore for HostStore {
@@ -61,6 +98,13 @@ impl DeviceSink {
 }
 impl Sink for DeviceSink {
     type Error = String;
+    fn observe(
+        &mut self,
+        event: &niles_withings::provider::Event,
+        observation: niles_withings::adapter::Observation,
+    ) {
+        super::delivery_diagnostics::observe(event, observation);
+    }
     fn publish_reading(&mut self, reading: Reading) -> Result<(), String> {
         let id = self.target()?;
         *self.occupancy.borrow_mut() = None;

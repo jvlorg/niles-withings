@@ -1,4 +1,3 @@
-#![allow(clippy::too_many_arguments)]
 #[cfg(not(test))]
 use niles::integration as host;
 #[cfg(test)]
@@ -15,13 +14,48 @@ use niles_withings::{
 use std::{cell::RefCell, rc::Rc};
 #[cfg(test)]
 use test_host as host;
-wit_bindgen::generate!({world:"plugin",path:"wit/niles-integration.wit"});
+// Fixed upstream WIT signatures exceed Clippy's argument threshold. Restrict
+// the exception to generated bindings, not handwritten component code.
+#[allow(clippy::too_many_arguments)]
+mod bindings {
+    wit_bindgen::generate!({world:"plugin",path:"wit/niles-integration.wit"});
+}
+use bindings::*;
 mod automatic;
+mod delivery_diagnostics;
+mod journal_io;
+mod lifecycle_diagnostics;
 struct Plugin;
 export!(Plugin);
 
 mod host_adapter;
 use host_adapter::{DeviceSink, HostStore, HostTransport};
+
+fn journal(
+    now: i64,
+    event: &str,
+    stage: &str,
+    outcome: &str,
+) -> Result<(), niles_withings::diagnostics::Error> {
+    journal_io::write(niles_withings::diagnostics::Record {
+        received_at: now,
+        provider_at: None,
+        mat: None,
+        event: event.into(),
+        stage: stage.into(),
+        outcome: outcome.into(),
+        correlation: journal_io::correlation(),
+        count: 1,
+        first_at: now,
+        last_at: now,
+    })
+}
+
+fn record_event(event: &str, stage: &str, outcome: &str) {
+    if let Ok(timestamp) = now() {
+        let _ = journal(timestamp, event, stage, outcome);
+    }
+}
 
 fn setting(key: &str) -> Result<String, String> {
     match config::get(key) {
@@ -82,6 +116,7 @@ fn reconcile_owner(owner: &mut Owner<HostStore, DeviceSink>) -> Result<(), Strin
         &hook,
         "Niles Withings",
     );
+    lifecycle_diagnostics::reconciled(status);
     let ready = status.status == niles_withings::lifecycle::Status::Ready;
     automatic::FLEET.with(|f| {
         let mut f = f.borrow_mut();
@@ -119,6 +154,8 @@ fn refresh_panel() {
 }
 impl Guest for Plugin {
     fn init() -> Result<(), String> {
+        lifecycle_diagnostics::reset();
+        journal_io::reset();
         // A host sensor exists only after successful inventory registration.
         // Connection/discovery failure is represented by the revoked runtime;
         // keep the plugin loaded so the host-owned Connect route remains usable.
@@ -135,6 +172,7 @@ impl Guest for Plugin {
                 })
             });
         }
+        lifecycle_diagnostics::sample("startup");
         Ok(())
     }
     fn tools() -> Vec<ToolDef> {
@@ -142,9 +180,68 @@ impl Guest for Plugin {
             name: "withings_status".into(),
             description: "Report actual Withings adapter readiness".into(),
             schema: r#"{"type":"object","properties":{}}"#.into(),
+        }, ToolDef {
+            name: "withings_diagnostics_export".into(),
+            description: "Read a paginated, privacy-safe local Withings diagnostic journal. Does not contact Withings or change state.".into(),
+            schema: r#"{"type":"object","properties":{"page":{"type":"integer","minimum":0},"per_page":{"type":"integer","minimum":1,"maximum":100},"snapshot":{"type":"string","description":"Token from page 0; required for later pages"}}}"#.into(),
         }]
     }
-    fn call_tool(_: String, _: String) -> Result<String, String> {
+    fn call_tool(name: String, args: String) -> Result<String, String> {
+        if name == "withings_diagnostics_export" {
+            if args.len() > 1024 {
+                return Err("Diagnostic arguments too large".into());
+            }
+            #[derive(serde::Deserialize)]
+            #[serde(deny_unknown_fields)]
+            struct Args {
+                #[serde(default)]
+                page: usize,
+                #[serde(default = "default_page_size")]
+                per_page: usize,
+                snapshot: Option<String>,
+            }
+            fn default_page_size() -> usize {
+                25
+            }
+            let args: Args = serde_json::from_str(&args)
+                .map_err(|_| "Invalid diagnostic arguments".to_string())?;
+            if args
+                .snapshot
+                .as_ref()
+                .is_some_and(|s| s.len() != 16 || !s.bytes().all(|b| b.is_ascii_hexdigit()))
+            {
+                return Err("Invalid diagnostic snapshot".into());
+            }
+            let export = niles_withings::diagnostics::export_at(
+                &mut HostStore,
+                now()?,
+                args.page,
+                args.per_page,
+                args.snapshot.as_deref(),
+            )
+            .map_err(|e| match e {
+                niles_withings::diagnostics::Error::SnapshotChanged => {
+                    "Journal changed; restart export at page 0".to_string()
+                }
+                _ => "Diagnostic journal unavailable or invalid pagination".to_string(),
+            })?;
+            let mut value = serde_json::to_value(export)
+                .map_err(|_| "Diagnostic export unavailable".to_string())?;
+            value["evidence_scope"] =
+                serde_json::json!("best_effort_withings_only_not_automation_execution");
+            value["unflushed_summaries_may_be_lost_on_restart"] = serde_json::json!(true);
+            let (failures, suppressed) = journal_io::pending();
+            value["pending_write_failures"] = serde_json::json!(failures);
+            value["pending_suppressed_requests"] = serde_json::json!(suppressed);
+            if failures > 0 || suppressed > 0 {
+                value["complete"] = serde_json::json!(false);
+            }
+            return serde_json::to_string(&value)
+                .map_err(|_| "Diagnostic export unavailable".to_string());
+        }
+        if name != "withings_status" {
+            return Err("Unknown tool".into());
+        }
         Ok(automatic::FLEET.with(|f| {
             let f = f.borrow();
             format!(
@@ -175,6 +272,10 @@ impl Guest for Plugin {
                 }
             }
         });
+        lifecycle_diagnostics::sample("reconcile");
+        if let Ok(at) = now() {
+            journal_io::flush(at, true);
+        }
         refresh_panel();
     }
     fn on_event(_: Event) {}
@@ -297,39 +398,53 @@ impl Guest for Plugin {
         query: Vec<(String, String)>,
         person: Option<String>,
     ) -> Result<String, String> {
-        OWNER.with(|o| o.borrow_mut().pause());
-        automatic::revoke()?;
-        automatic::FLEET.with(|f| {
-            let mut f = f.borrow_mut();
-            f.account = None;
-            f.inventory_valid = false;
-        });
+        let received_at = now().ok();
+        let result = (|| {
+            OWNER.with(|o| o.borrow_mut().pause());
+            automatic::revoke()?;
+            automatic::FLEET.with(|f| {
+                let mut f = f.borrow_mut();
+                f.account = None;
+                f.inventory_valid = false;
+            });
 
-        let cb = withings_client::CallbackUrl::parse(&callback)
-            .map_err(|_| "Invalid callback".to_string())?;
-        let client = setting("client_id")?;
-        let secret = Secret::new(config::secret("client_secret").ok_or("Client secret missing")?)
-            .map_err(|_| "Invalid client secret")?;
-        let outcome = OWNER.with(|o| {
-            o.borrow_mut()
-                .callback(
-                    &mut HostTransport,
-                    &mut HostStore,
-                    &cb,
-                    &query,
-                    person.as_deref(),
-                    &client,
-                    &secret,
-                    now()?,
-                )
-                .map_err(|error| format!("Account callback failed: {error}"))
-        })?;
-        if matches!(outcome, niles_withings::application::CallbackResult::Denied) {
-            return Ok("Withings access was not granted; delivery is disabled.".into());
+            let cb = withings_client::CallbackUrl::parse(&callback)
+                .map_err(|_| "Invalid callback".to_string())?;
+            let client = setting("client_id")?;
+            let secret =
+                Secret::new(config::secret("client_secret").ok_or("Client secret missing")?)
+                    .map_err(|_| "Invalid client secret")?;
+            let outcome = OWNER.with(|o| {
+                o.borrow_mut()
+                    .callback(
+                        &mut HostTransport,
+                        &mut HostStore,
+                        &cb,
+                        &query,
+                        person.as_deref(),
+                        &client,
+                        &secret,
+                        now()?,
+                    )
+                    .map_err(|error| format!("Account callback failed: {error}"))
+            })?;
+            if matches!(outcome, niles_withings::application::CallbackResult::Denied) {
+                record_event("callback", "decision", "denied");
+                return Ok("Withings access was not granted; delivery is disabled.".into());
+            }
+            activate_saved()?;
+            record_event("callback", "activation", "complete");
+            refresh_panel();
+            Ok("Credentials saved. Supported sleep mats were discovered automatically; occupancy awaits fresh events.".into())
+        })();
+        if let Some(at) = received_at {
+            let _ = journal(at, "callback", "receipt", "received");
         }
-        activate_saved()?;
-        refresh_panel();
-        Ok("Credentials saved. Supported sleep mats were discovered automatically; occupancy awaits fresh events.".into())
+        if result.is_err() {
+            record_event("callback", "decision", "failed");
+        }
+        lifecycle_diagnostics::sample("reconcile");
+        result
     }
     fn on_webhook(request: InboundRequest) -> InboundResponse {
         let content_type = request
@@ -353,7 +468,9 @@ impl Guest for Plugin {
                 };
             }
         };
+        delivery_diagnostics::begin();
         let result = OWNER.with(|o| o.borrow_mut().webhook(&input, timestamp, 86400, 300));
+        delivery_diagnostics::finish(timestamp);
         refresh_panel();
         InboundResponse {
             status: result.status,
@@ -362,6 +479,9 @@ impl Guest for Plugin {
         }
     }
     fn stop() {
+        if let Ok(at) = now() {
+            journal_io::flush(at, true);
+        }
         OWNER.with(|o| o.borrow_mut().pause());
         let _ = automatic::revoke();
     }

@@ -10,6 +10,7 @@ crate-type = ["cdylib"]
 niles-withings = { path = ".." }
 wit-bindgen = "0.41"
 serde_json = "1"
+serde = { version = "1", features = ["derive"] }
 
 [[package.metadata.niles]]
 name = "withings"

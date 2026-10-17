@@ -14,7 +14,9 @@ Rust add-on for Withings Sleep bed-presence, onboarding and events. Scope is in-
 - The Withings page is diagnostics plus a discovery refresh control, not a setup selection page. A show/hide switch is implemented in the separate local Niles frontend candidate using existing menu visibility configuration; it is not installed on test Niles.
 - Supported eligibility uses the provider's `Sleep Monitor` type, not guessed model mappings. The installed alpha.7 discovered Aura Sensor V2 Sleep Monitor and received real bed-in/bed-out events. Alpha.8 is installed on isolated test Niles and has automatically restored that mat with its existing identity; both physical state updates and saved-account recovery through a full test-host restart have been observed; strict live replay-action counting remains outstanding.
 
-The pinned Niles 0.3 host checker and stand-in dev host can validate disconnected loading only; this is not live provider proof or a production installation.
+The local source candidate also includes a bounded persistent diagnostic journal: canonical receipt/decision/actual publication records, health summaries, quota-priority recovery and read-only snapshot-guarded JSON export. The 1,080-record sizing fixture uses 246,570 bytes under a 528 KiB journal cap. See [diagnostics and export](docs/diagnostics.md). This feature is **not in the published/installed alpha.10**.
+
+The real pinned Niles 0.3 checker/dev host verifies disconnected loading and journal retention across two separate local processes. This is not live provider proof, an installed update test or a production installation.
 
 ## Settings presentation — direction and discussion with Mark
 

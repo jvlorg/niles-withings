@@ -164,6 +164,7 @@ pub mod lifecycle;
 /// Host-neutral executable account, callback and webhook application boundary.
 pub mod application;
 pub mod coordinator;
+pub mod diagnostics;
 pub mod runtime;
 
 pub mod presence {
@@ -402,6 +403,20 @@ pub mod adapter {
         type Error: fmt::Display;
         fn publish_reading(&mut self, reading: Reading) -> Result<(), Self::Error>;
         fn publish_action(&mut self, action: &'static str) -> Result<(), Self::Error>;
+        /// Best-effort observation of the actual delivery path, never a decision input.
+        fn observe(&mut self, _event: &provider::Event, _observation: Observation) {}
+    }
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum Observation {
+        Transition,
+        Unchanged,
+        DuplicateOrStale,
+        Conflict,
+        StorageFailed,
+        ReadingFailed,
+        ActionFailed,
+        ActionPublished,
+        NoAction,
     }
     pub fn host_action(action: &'static str) -> Option<&'static str> {
         match action {
@@ -497,20 +512,38 @@ pub mod adapter {
                 .map_err(DeliveryError::Parse)?;
             let mut candidate = self.state.clone();
             let outcome = candidate.apply(&event);
+            self.sink.observe(
+                &event,
+                if outcome.uncertain {
+                    Observation::Conflict
+                } else if outcome.action.is_some() {
+                    Observation::Transition
+                } else if candidate != self.state {
+                    Observation::Unchanged
+                } else {
+                    Observation::DuplicateOrStale
+                },
+            );
             if candidate != self.state {
-                self.store
-                    .save(&candidate.persist())
-                    .map_err(|_| DeliveryError::Storage)?;
+                if self.store.save(&candidate.persist()).is_err() {
+                    self.sink.observe(&event, Observation::StorageFailed);
+                    return Err(DeliveryError::Storage);
+                }
                 self.state = candidate;
             }
             let mapped = map_state(&self.state, outcome.action);
-            self.sink
-                .publish_reading(mapped.reading)
-                .map_err(|_| DeliveryError::ReadingSink)?;
+            if self.sink.publish_reading(mapped.reading).is_err() {
+                self.sink.observe(&event, Observation::ReadingFailed);
+                return Err(DeliveryError::ReadingSink);
+            }
             if let Some(action) = mapped.action {
-                self.sink
-                    .publish_action(action)
-                    .map_err(|_| DeliveryError::ActionSink { action })?;
+                if self.sink.publish_action(action).is_err() {
+                    self.sink.observe(&event, Observation::ActionFailed);
+                    return Err(DeliveryError::ActionSink { action });
+                }
+                self.sink.observe(&event, Observation::ActionPublished);
+            } else {
+                self.sink.observe(&event, Observation::NoAction);
             }
             Ok(())
         }
