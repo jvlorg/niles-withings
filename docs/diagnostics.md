@@ -2,7 +2,7 @@
 
 ## Delivery and evidence boundary
 
-Implemented in the standalone add-on, not Niles core. The journal uses the existing host-managed persistent key/value store. It is **not installed in the published alpha.10**. Production and test installations are unchanged until a separately approved development release/update.
+Implemented in the standalone add-on, not Niles core. The journal uses the existing host-managed persistent key/value store. It is published and installed as **alpha.11 on test Niles only**. Production is unchanged. Connected operation is currently blocked by a pre-existing unresolved account refresh.
 
 The canonical delivery adapter emits a typed observation after applying its existing reducer and after each actual persistence/publication result. The component buffers at most two observations, then writes receipt/decision/result records **after essential state and actions**. There is no second diagnostic parser or reducer and no inference of publication from HTTP 200.
 
@@ -51,6 +51,6 @@ Main's final local gates: **132 workspace tests**, formatting, strict all-target
 
 The maintained `scripts/verify-niles03-host.sh` runs the real pinned Niles checker, loads/renders the disconnected component, then starts a second dev-host process and exports both retained startup records. This is actual local host/file-backed process-restart proof, not connected production proof.
 
-Still separately gated: publish/install a new prerelease, actual test-Niles PostgreSQL-backed restart and add-on update readback, ongoing provider access, live callback observation, and the later household test. The checked package still carries the alpha.10 development manifest; do not mistake the local artifact for the published alpha.10 release.
+Alpha.11 was installed using the normal hash-verified update flow with no added permissions. All four prior ordinary-storage entries and encrypted-secret rows survived unchanged. A full test-host restart retained its PostgreSQL journal record and added a second startup record. The pre-update account record already had an unresolved refresh-pending marker, so account restoration is blocked; no credentials or markers were changed. Temporary outbound was closed, dry-run preserved and health verified. Still pending: approved account recovery, ongoing provider access, live callback observation, live assistant tool export, journal retention across a subsequent version update, and the household test.
 
 Niles automation execution remains a separate evidence gap: the inspected host retains only its last 20 runs per automation in memory, and the add-on interface exposes no attributable started/completed/failed automation hook. Successful `action_published` does **not** prove an automation ran.
