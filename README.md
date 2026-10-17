@@ -16,6 +16,16 @@ Rust add-on for Withings Sleep bed-presence, onboarding and events. Scope is in-
 
 The pinned Niles 0.3 host checker and stand-in dev host can validate disconnected loading only; this is not live provider proof or a production installation.
 
+## Settings presentation — direction and discussion with Mark
+
+The intended Withings settings experience should visually match Niles' built-in add-ons: icon/title and concise description, consistent spacing and dividers, familiar inputs and action buttons, clear account status, and only necessary setup controls. Automatic mat discovery stays automatic; manual account/device identifiers and diagnostic clutter must not return.
+
+Keep Withings-specific presentation and behavior in this standalone add-on. Do not implement a Withings-specific Niles core panel or modify the shared Niles settings renderer to achieve this design. The desired direction is add-on-owned presentation following Niles' visual conventions, rather than greater coupling to its built-in integration code.
+
+**Current limitation:** the inspected Niles 0.3 interface renders custom-add-on settings through host-owned `PluginPanel` / `PluginSettings`. The manifest supplies metadata, labels, help text and field types; it does not give this add-on independent HTML/CSS control over that settings panel. An add-on-owned settings layout matching the reference is therefore a design goal, not an implemented or verified capability. The existing diagnostic surface is not a replacement for the settings panel.
+
+**For discussion with Mark (not yet sent):** is there a supported, sandboxed way for standalone add-ons to own their settings presentation while following Niles' built-in visual conventions, without integration-specific core changes? Clarify the supported extension boundary and reusable styling contract. Preserve host-owned OAuth state/browser validation, encrypted secret storage and add-on removal; visual independence must not bypass those safeguards. Also discuss the existing limitation around per-install diagnostic-menu visibility.
+
 ## Local commands
 
 ```text
