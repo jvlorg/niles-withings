@@ -21,7 +21,6 @@ struct Ledger {
     empty_inventory: bool,
     multiple_mats: bool,
     legacy_id: bool,
-    configured_user: Option<String>,
     second_account: bool,
     subscription_error: bool,
 }
@@ -36,11 +35,7 @@ pub mod config {
             match k {
                 "device_id" if super::LEDGER.with(|l| l.borrow().legacy_id) => "offline-mat",
                 "room" => "bedroom",
-                "user_id" => {
-                    return super::LEDGER
-                        .with(|l| l.borrow().configured_user.clone())
-                        .map(SettingValue::Text);
-                }
+                "user_id" => panic!("Removed account restriction must never be read"),
                 "client_id" => "fixture-client",
                 _ => return None,
             }
@@ -619,15 +614,7 @@ fn multiple_mats_second_mat_entry_duplicate_exit_and_removal() {
     assert_eq!(Plugin::on_webhook(event(50)).status, 200);
 }
 #[test]
-fn account_restrictions_and_damaged_records_fail_closed() {
-    for expected in ["bad", "999"] {
-        reset();
-        Plugin::init().unwrap();
-        LEDGER.with(|l| l.borrow_mut().configured_user = Some(expected.into()));
-        assert!(connect().is_err());
-        Plugin::on_timer("lifecycle".into());
-        assert_eq!(Plugin::on_webhook(event(50)).status, 503);
-    }
+fn damaged_account_records_fail_closed() {
     reset();
     Plugin::init().unwrap();
     connect().unwrap();

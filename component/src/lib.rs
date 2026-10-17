@@ -29,28 +29,12 @@ fn setting(key: &str) -> Result<String, String> {
         _ => Err(format!("Required setting {key} missing")),
     }
 }
-fn configured_account() -> Result<Option<u64>, String> {
-    match config::get("user_id") {
-        None => Ok(None),
-        Some(config::SettingValue::Text(value)) => value
-            .parse::<u64>()
-            .ok()
-            .filter(|n| *n > 0)
-            .map(Some)
-            .ok_or_else(|| "Configured user_id must be a positive integer".into()),
-        _ => Err("Configured user_id must be a positive integer".into()),
-    }
-}
 fn account_id() -> Result<u64, String> {
-    let configured = configured_account()?;
     let raw = HostStore.read_account_record()?;
     let raw = raw.ok_or("Withings account is not connected")?;
     let identity =
         niles_withings::application::SecureAccountRecord::authenticated_identity(&raw, now()?)
             .map_err(|_| "Account restore failed")?;
-    if configured.is_some_and(|expected| expected != identity) {
-        return Err("Connected account does not match configured account".into());
-    }
     Ok(identity)
 }
 #[cfg(test)]
@@ -321,7 +305,6 @@ impl Guest for Plugin {
             f.inventory_valid = false;
         });
 
-        let expected_account = configured_account()?;
         let cb = withings_client::CallbackUrl::parse(&callback)
             .map_err(|_| "Invalid callback".to_string())?;
         let client = setting("client_id")?;
@@ -341,20 +324,8 @@ impl Guest for Plugin {
                 )
                 .map_err(|error| format!("Account callback failed: {error}"))
         })?;
-        match outcome {
-            niles_withings::application::CallbackResult::Denied => {
-                return Ok("Withings access was not granted; delivery is disabled.".into());
-            }
-            niles_withings::application::CallbackResult::Stored { user_id }
-                if expected_account.is_some_and(|expected| expected != user_id) =>
-            {
-                OWNER.with(|o| o.borrow_mut().pause());
-                return Err(
-                    "Connected account does not match configured account; delivery is disabled."
-                        .into(),
-                );
-            }
-            _ => {}
+        if matches!(outcome, niles_withings::application::CallbackResult::Denied) {
+            return Ok("Withings access was not granted; delivery is disabled.".into());
         }
         activate_saved()?;
         refresh_panel();
