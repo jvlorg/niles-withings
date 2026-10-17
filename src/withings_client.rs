@@ -501,12 +501,69 @@ struct Envelope<T> {
 }
 #[derive(Deserialize)]
 struct TokenBody {
+    #[serde(deserialize_with = "deserialize_user_id")]
     userid: u64,
     client_id: Option<String>,
     access_token: String,
     refresh_token: String,
     expires_in: u64,
 }
+fn deserialize_user_id<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<u64, D::Error> {
+    let value = serde_json::Value::deserialize(deserializer)?;
+    let parsed = match value {
+        serde_json::Value::Number(n) => n.as_u64(),
+        serde_json::Value::String(s)
+            if !s.is_empty() && s.len() <= 20 && s.bytes().all(|b| b.is_ascii_digit()) =>
+        {
+            s.parse::<u64>().ok()
+        }
+        _ => None,
+    };
+    parsed
+        .filter(|id| *id > 0)
+        .ok_or_else(|| serde::de::Error::custom("invalid account identifier"))
+}
+
+#[cfg(test)]
+#[test]
+fn token_response_accepts_numeric_or_decimal_string_identity() {
+    for id in [serde_json::json!(123), serde_json::json!("123")] {
+        let body = serde_json::json!({"status":0,"body":{"userid":id,"access_token":"fixture-access","refresh_token":"fixture-refresh","expires_in":3600}});
+        let tokens = token_response(
+            HttpResponse {
+                status: 200,
+                body: serde_json::to_vec(&body).unwrap(),
+            },
+            "fixture-client",
+        )
+        .unwrap();
+        assert_eq!(tokens.user_id, 123);
+    }
+    for id in [
+        serde_json::json!(0),
+        serde_json::json!("0"),
+        serde_json::json!("-1"),
+        serde_json::json!("+123"),
+        serde_json::json!(" 123"),
+        serde_json::json!("1.5"),
+        serde_json::json!("18446744073709551616"),
+        serde_json::json!(true),
+        serde_json::json!(null),
+    ] {
+        let body = serde_json::json!({"status":0,"body":{"userid":id,"access_token":"fixture-access","refresh_token":"fixture-refresh","expires_in":3600}});
+        assert!(
+            token_response(
+                HttpResponse {
+                    status: 200,
+                    body: serde_json::to_vec(&body).unwrap()
+                },
+                "fixture-client"
+            )
+            .is_err()
+        );
+    }
+}
+
 #[derive(Deserialize)]
 struct ListBody {
     profiles: Vec<Profile>,
