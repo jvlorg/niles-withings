@@ -9,6 +9,8 @@ const TOKEN_URL: &str = "https://wbsapi.withings.net/v2/oauth2";
 const NOTIFY_URL: &str = "https://wbsapi.withings.net/notify";
 const USER_URL: &str = "https://wbsapi.withings.net/v2/user";
 pub const BED_SCOPE: &str = "user.sleepevents";
+/// Device inventory plus bed events; no metrics or activity history.
+pub const SETUP_SCOPE: &str = "user.info,user.sleepevents";
 pub const BED_APPLI: u8 = 50;
 pub const BED_APPLI_OUT: u8 = 51;
 pub const CALLBACK_MAX_BYTES: usize = 255;
@@ -178,7 +180,7 @@ pub fn authorization_url(
     Ok(format!(
         "{AUTH_URL}?response_type=code&client_id={}&scope={}&redirect_uri={}&state={}",
         query_encode(client_id),
-        query_encode(BED_SCOPE),
+        query_encode(SETUP_SCOPE),
         query_encode(callback),
         query_encode(state.expose_secret())
     ))
@@ -820,7 +822,13 @@ mod tests {
     #[test]
     fn auth_scope_encoding_and_callback_validation() {
         let u = authorization_url("client id", CB, &Secret::new(STATE).unwrap()).unwrap();
-        assert!(u.contains("scope=user.sleepevents"));
+        let parsed = url::Url::parse(&u).unwrap();
+        let scopes: Vec<_> = parsed
+            .query_pairs()
+            .filter(|(k, _)| k == "scope")
+            .map(|(_, v)| v.into_owned())
+            .collect();
+        assert_eq!(scopes, ["user.info,user.sleepevents"]);
         assert!(u.contains("client_id=client%20id"));
         for bad in [
             "http://example.org",
