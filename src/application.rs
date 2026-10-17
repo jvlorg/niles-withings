@@ -370,6 +370,7 @@ pub enum ApplicationError {
     RecoveryRequired,
     InvalidSelection,
     Provider,
+    TokenExchange(ClientError),
     Storage,
     InvalidWebhook,
     Delivery,
@@ -429,7 +430,7 @@ pub fn on_callback<T: HttpTransport, S: AccountSecretStore>(
         &code,
         callback.as_str(),
     )
-    .map_err(map_client)?;
+    .map_err(ApplicationError::TokenExchange)?;
     if tokens.user_id == 0 {
         return Err(ApplicationError::InvalidRecord);
     }
