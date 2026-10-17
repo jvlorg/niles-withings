@@ -525,9 +525,9 @@ impl Guest for Plugin {
                     let _ = reconcile_owner(&mut owner);
                     match owner.discover(&mut transport, &mut store, now()?) {
                         Ok(_) => Ok("Sleep mat discovery refreshed".to_string()),
-                        Err(_) => {
+                        Err(error) => {
                             owner.discovery_failed();
-                            Err("Sleep mat discovery failed".to_string())
+                            Err(format!("Sleep mat discovery failed: {error}"))
                         }
                     }
                 }

@@ -371,6 +371,7 @@ pub enum ApplicationError {
     InvalidSelection,
     Provider,
     TokenExchange(ClientError),
+    Discovery(ClientError),
     Storage,
     InvalidWebhook,
     Delivery,
@@ -457,8 +458,8 @@ pub fn discover_account_devices<T: HttpTransport>(
     if now < record.acquired_at || now >= record.expires_at {
         return Err(ApplicationError::InvalidRecord);
     }
-    let devices =
-        withings_client::list_devices(transport, &record.access_token()?).map_err(map_client)?;
+    let devices = withings_client::list_devices(transport, &record.access_token()?)
+        .map_err(ApplicationError::Discovery)?;
     Ok(withings_client::select_sleep_device(
         record.user_id(),
         authenticated_user,
@@ -542,10 +543,6 @@ pub fn adapter_from_binding<S: Store, H: Sink>(
     sink: H,
 ) -> Result<Adapter<S, H>, DeliveryError> {
     Adapter::new(binding.identity(), store, sink)
-}
-
-fn map_client(_: ClientError) -> ApplicationError {
-    ApplicationError::Provider
 }
 
 #[derive(Clone, PartialEq, Eq)]
