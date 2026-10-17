@@ -11,7 +11,7 @@ Rust add-on for Withings Sleep bed-presence, onboarding and events. Scope is in-
 - Niles component supports host Connect OAuth and automatic activation of every eligible Sleep Monitor mat. No account/device ID or mat-selection step is required in normal setup. Account identity comes exclusively from the authenticated Withings account. The unused manual account-restriction setting and its runtime checks have been removed at the owner’s request.
 - One shared account/refresh/subscription lifecycle feeds independent per-mat state, deduplication and `bed_in` / `bed_out` actions. Host IDs are deterministic per account/device. Alpha.7's persisted selected mat retains its `withings_sleep` alias and scoped history; another account cannot inherit them.
 - Startup restores unknown occupancy without replaying actions. Failed inventory, registration or storage blocks delivery; removed devices become unavailable. Durable host-ID ownership allows cold-start revocation even if credentials cannot restore.
-- The Withings page is diagnostics plus a discovery refresh control, not a setup selection page. A per-install show/hide menu toggle remains blocked by the pinned host's static menu contract; no working toggle is claimed.
+- The Withings page is diagnostics plus a discovery refresh control, not a setup selection page. A show/hide switch is implemented in the separate local Niles frontend candidate using existing menu visibility configuration; it is not installed on test Niles.
 - Supported eligibility uses the provider's `Sleep Monitor` type, not guessed model mappings. The installed alpha.7 discovered Aura Sensor V2 Sleep Monitor and received real bed-in/bed-out events. Alpha.8 is installed on isolated test Niles and has automatically restored that mat with its existing identity; both physical state updates and saved-account recovery through a full test-host restart have been observed; strict live replay-action counting remains outstanding.
 
 The pinned Niles 0.3 host checker and stand-in dev host can validate disconnected loading only; this is not live provider proof or a production installation.
@@ -20,11 +20,17 @@ The pinned Niles 0.3 host checker and stand-in dev host can validate disconnecte
 
 The intended Withings settings experience should visually match Niles' built-in add-ons: icon/title and concise description, consistent spacing and dividers, familiar inputs and action buttons, clear account status, and only necessary setup controls. Automatic mat discovery stays automatic; manual account/device identifiers and diagnostic clutter must not return.
 
-Keep Withings-specific presentation and behavior in this standalone add-on. Do not implement a Withings-specific Niles core panel or modify the shared Niles settings renderer to achieve this design. The desired direction is add-on-owned presentation following Niles' visual conventions, rather than greater coupling to its built-in integration code.
+The requested change is alignment of the existing settings page, not an independent HTML/CSS page or a new rendering architecture:
 
-**Current limitation:** the inspected Niles 0.3 interface renders custom-add-on settings through host-owned `PluginPanel` / `PluginSettings`. The manifest supplies metadata, labels, help text and field types; it does not give this add-on independent HTML/CSS control over that settings panel. An add-on-owned settings layout matching the reference is therefore a design goal, not an implemented or verified capability. The existing diagnostic surface is not a replacement for the settings panel.
+- Remove the prominent Status / From / Version / By / Installed metadata block from the main settings view.
+- Present **Show Withings page** as a native switch row: label and short explanation on the left, switch on the right. Persist page visibility independently from add-on enablement; hiding the page must not stop bed-event automations. Verify actual navigation visibility, not merely empty page content.
+- Place Save immediately to the right of the corresponding input, rather than below it; preserve validation, saving and error feedback.
 
-**For discussion with Mark (not yet sent):** is there a supported, sandboxed way for standalone add-ons to own their settings presentation while following Niles' built-in visual conventions, without integration-specific core changes? Clarify the supported extension boundary and reusable styling contract. Preserve host-owned OAuth state/browser validation, encrypted secret storage and add-on removal; visual independence must not bypass those safeguards. Also discuss the existing limitation around per-install diagnostic-menu visibility.
+Keep Withings account/device/event logic standalone. Preserve host-owned OAuth validation, encrypted secrets and add-on removal. The earlier proposal for independent settings markup was a misunderstanding and is withdrawn.
+
+**Local candidate implemented, not deployed:** a frontend-only Niles patch now removes the metadata table, adds the native visibility switch and moves Save beside each ordinary input. It uses the existing `menu.hidden` configuration; the earlier claim that a static manifest prevented menu hiding was too broad. No new renderer, backend schema, WIT or Withings runtime changes are needed. Existing page visibility is preserved until explicitly changed.
+
+See [the patch, screenshots and verification record](docs/settings-alignment/README.md). Production frontend build and all 1,233 frontend tests passed; desktop/phone browser checks used the actual components with explicitly synthetic configuration. Installed-host persistence and live automation continuity have not been re-tested for this candidate. The patch remains local and has not been sent to Mark or deployed.
 
 ## Local commands
 

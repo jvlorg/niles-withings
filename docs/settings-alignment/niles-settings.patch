@@ -1,0 +1,426 @@
+diff --git a/web/src/components/PluginPageVisibility.tsx b/web/src/components/PluginPageVisibility.tsx
+new file mode 100644
+index 0000000..10cb6cc
+--- /dev/null
++++ b/web/src/components/PluginPageVisibility.tsx
+@@ -0,0 +1,64 @@
++import { useState } from "react";
++import { useQueryClient } from "@tanstack/react-query";
++import { Switch } from "@/components/ui/switch";
++import { api, valueAt } from "@/lib/api";
++import type { PluginSummary } from "@/lib/api";
++
++function hiddenPages(effective: unknown): string[] {
++  const value = valueAt(effective, "menu.hidden");
++  return Array.isArray(value) ? value.filter((id): id is string => typeof id === "string") : [];
++}
++
++/** Menu presentation only: never changes plugin enablement or provider settings. */
++export function PluginPageVisibility({ plugin, effective }: {
++  plugin: PluginSummary;
++  effective: unknown;
++}) {
++  const client = useQueryClient();
++  const [busy, setBusy] = useState(false);
++  const [error, setError] = useState<string | null>(null);
++  const hidden = hiddenPages(effective);
++
++  async function change(id: string, shown: boolean) {
++    setBusy(true);
++    setError(null);
++    try {
++      // Read the current list so another page's visibility is preserved.
++      const current = await api.getConfig();
++      const next = hiddenPages(current.effective).filter((entry) => entry !== id);
++      if (!shown) next.push(id);
++      await api.patchConfig({ menu: { hidden: next } });
++      // Read back canonical state; a failed write must not flip the switch.
++      const confirmed = await api.getConfig();
++      client.setQueryData(["config"], confirmed);
++      if (hiddenPages(confirmed.effective).includes(id) === shown) {
++        throw new Error("Page visibility was not saved. Try again.");
++      }
++    } catch (e) {
++      setError(e instanceof Error ? e.message : "Could not save page visibility.");
++    } finally {
++      setBusy(false);
++    }
++  }
++
++  if (plugin.menu.length === 0) return null;
++  return (
++    <section aria-label="Page visibility" className="flex flex-col gap-3 border-b pb-4">
++      {plugin.menu.map((page) => {
++        const id = `${plugin.id}.${page.id}`;
++        const label = `Show ${page.label} page`;
++        return (
++          <div key={id} className="flex items-center justify-between gap-3">
++            <div className="min-w-0">
++              <p className="text-sm font-medium">{label}</p>
++              <p className="text-muted-foreground text-xs">Show in the menu. Automations keep running when hidden.</p>
++            </div>
++            <Switch aria-label={label} checked={!hidden.includes(id)}
++              disabled={busy || effective === undefined} onCheckedChange={(shown) => void change(id, shown)} />
++          </div>
++        );
++      })}
++      {error && <p role="alert" className="text-destructive text-sm">{error}</p>}
++    </section>
++  );
++}
+diff --git a/web/src/components/PluginPanel.tsx b/web/src/components/PluginPanel.tsx
+index 9386284..36f8795 100644
+--- a/web/src/components/PluginPanel.tsx
++++ b/web/src/components/PluginPanel.tsx
+@@ -11,7 +11,8 @@ import {
+ } from "@/components/ui/select";
+ import { PluginInboundSection } from "@/components/PluginInbound";
+ import { PluginLog } from "@/components/PluginLog";
+-import { PluginLogo, PluginPreviewView, shortRepo } from "@/components/PluginPreview";
++import { PluginLogo, PluginPreviewView } from "@/components/PluginPreview";
++import { PluginPageVisibility } from "@/components/PluginPageVisibility";
+ import { PluginSettings } from "@/components/PluginSettings";
+ import { api } from "@/lib/api";
+ import type { PluginPreview, PluginSummary, SecretsReport } from "@/lib/api";
+@@ -65,15 +66,6 @@ export function PluginRow({
+   );
+ }
+ 
+-function day(iso: string | null): string | null {
+-  if (!iso) return null;
+-  return new Date(iso).toLocaleDateString(undefined, {
+-    day: "numeric",
+-    month: "short",
+-    year: "numeric",
+-  });
+-}
+-
+ /**
+  * An installed plugin's panel: where it came from, its settings, where
+  * its widgets go, its log, and switching it off, updating, rolling back
+@@ -124,7 +116,6 @@ export function PluginPanel({
+     }
+   }
+ 
+-  const installed = day(plugin.installed_at);
+ 
+   // A save restarts it; ask again until it has settled, so the panel
+   // says how the new settings went rather than "Starting".
+@@ -166,39 +157,8 @@ export function PluginPanel({
+ 
+   return (
+     <div className="flex flex-col gap-4 text-sm">
+-      <dl className="grid grid-cols-[auto_1fr] gap-x-4 gap-y-1">
+-        <dt className="text-muted-foreground">Status</dt>
+-        <dd>{setupLine(plugin)}</dd>
+-        {plugin.repo && (
+-          <>
+-            <dt className="text-muted-foreground">From</dt>
+-            <dd className="min-w-0 truncate">
+-              <a
+-                href={plugin.repo}
+-                target="_blank"
+-                rel="noopener noreferrer"
+-                className="underline underline-offset-2"
+-              >
+-                {shortRepo(plugin.repo)}
+-              </a>
+-            </dd>
+-          </>
+-        )}
+-        <dt className="text-muted-foreground">Version</dt>
+-        <dd>{plugin.version}</dd>
+-        {plugin.authors.length > 0 && (
+-          <>
+-            <dt className="text-muted-foreground">By</dt>
+-            <dd>{plugin.authors.join(", ")}</dd>
+-          </>
+-        )}
+-        {installed && (
+-          <>
+-            <dt className="text-muted-foreground">Installed</dt>
+-            <dd>{installed}</dd>
+-          </>
+-        )}
+-      </dl>
++      <PluginPageVisibility plugin={plugin} effective={effective} />
++      {plugin.status !== "running" && <p role="status" className="text-muted-foreground">{setupLine(plugin)}</p>}
+       {plugin.older_interface && (
+         <p className="text-muted-foreground">
+           Built for an older Niles. It works, and a newer release may be on{" "}
+@@ -246,7 +206,7 @@ export function PluginPanel({
+       )}
+ 
+       <PluginSettings
+-        key={`${plugin.id}-${plugin.updated_at}`}
++        key={plugin.id}
+         plugin={plugin}
+         rooms={rooms}
+         secrets={secrets}
+diff --git a/web/src/components/PluginSettings.tsx b/web/src/components/PluginSettings.tsx
+index 4f03a60..e286cfc 100644
+--- a/web/src/components/PluginSettings.tsx
++++ b/web/src/components/PluginSettings.tsx
+@@ -1,4 +1,4 @@
+-import { useState } from "react";
++import { useEffect, useRef, useState } from "react";
+ import { Button } from "@/components/ui/button";
+ import { Input } from "@/components/ui/input";
+ import {
+@@ -46,22 +46,32 @@ export function PluginSettings({ plugin, rooms, secrets, onSaved }: PluginSettin
+   const [errors, setErrors] = useState<Record<string, string>>({});
+   const [busy, setBusy] = useState(false);
+   const [failure, setFailure] = useState<string | null>(null);
+-  const [saved, setSaved] = useState(false);
++  const [saved, setSaved] = useState<string | null>(null);
++  const previous = useRef(draftOf(plugin.settings));
++  useEffect(() => {
++    const next = draftOf(plugin.settings);
++    const before = previous.current;
++    previous.current = next;
++    // Refresh untouched fields without losing another field's unsaved edit.
++    setDraft((current) => Object.fromEntries(Object.entries(next).map(([key, value]) =>
++      [key, current[key] === before[key] ? value : current[key] ?? value],
++    )));
++  }, [plugin.settings]);
+ 
+   const plain = plugin.settings.filter((s) => s.type !== "secret");
+   const secret = plugin.settings.filter((s) => s.type === "secret");
+   if (plugin.settings.length === 0) return null;
+ 
+-  async function save() {
+-    const { patch, errors } = settingsPatch(plugin.id, plugin.settings, draft);
++  async function save(setting: PluginSetting) {
++    const { patch, errors } = settingsPatch(plugin.id, [setting], draft);
+     setErrors(errors);
+     setFailure(null);
+-    setSaved(false);
++    setSaved(null);
+     if (Object.keys(errors).length > 0 || !patch) return;
+     setBusy(true);
+     try {
+       await api.patchConfig(patch);
+-      setSaved(true);
++      setSaved(setting.key);
+       onSaved();
+     } catch (e) {
+       setFailure(e instanceof Error ? e.message : String(e));
+@@ -71,44 +81,28 @@ export function PluginSettings({ plugin, rooms, secrets, onSaved }: PluginSettin
+   }
+ 
+   const set = (key: string, value: string | boolean) => {
+-    setSaved(false);
++    setSaved(null);
+     setDraft((d) => ({ ...d, [key]: value }));
+   };
+ 
+   return (
+     <section aria-label="Settings" className="flex flex-col gap-4">
+-      {plain.length > 0 && (
+-        <form
+-          className="flex flex-col gap-4"
+-          onSubmit={(e) => {
+-            e.preventDefault();
+-            save();
+-          }}
+-        >
+-          {plain.map((setting) => (
+-            <Field key={setting.key} setting={setting} error={errors[setting.key]}>
+-              <Control
+-                setting={setting}
+-                value={draft[setting.key]}
+-                rooms={rooms}
+-                disabled={busy}
+-                onChange={(value) => set(setting.key, value)}
+-              />
+-            </Field>
+-          ))}
+-          <div className="flex items-center gap-3">
+-            <Button type="submit" size="sm" disabled={busy}>
+-              Save
+-            </Button>
+-            {saved && <span className="text-muted-foreground text-xs">Saved; it restarts with them.</span>}
+-          </div>
+-          {failure && (
+-            <p role="alert" className="text-destructive text-sm">
+-              {failure}
+-            </p>
+-          )}
++      {plain.map((setting) => (
++        <form key={setting.key} onSubmit={(e) => { e.preventDefault(); void save(setting); }}>
++          <Field setting={setting} error={errors[setting.key]}>
++            <div className="flex min-w-0 items-center gap-2">
++              <div className="min-w-0 flex-1">
++                <Control setting={setting} value={draft[setting.key]} rooms={rooms}
++                  disabled={busy} onChange={(value) => set(setting.key, value)} />
++              </div>
++              <Button type="submit" size="sm" className="shrink-0" disabled={busy}
++                aria-label={`Save ${setting.label}`}>Save</Button>
++            </div>
++            {saved === setting.key && <span role="status" className="text-muted-foreground text-xs">Saved.</span>}
++          </Field>
+         </form>
+-      )}
++      ))}
++      {failure && <p role="alert" className="text-destructive text-sm">{failure}</p>}
+       {secret.map((setting) => (
+         <div key={setting.key} className="flex flex-col gap-1">
+           <SecretField
+diff --git a/web/src/components/PluginSettingsAlignment.test.tsx b/web/src/components/PluginSettingsAlignment.test.tsx
+new file mode 100644
+index 0000000..c83a79d
+--- /dev/null
++++ b/web/src/components/PluginSettingsAlignment.test.tsx
+@@ -0,0 +1,83 @@
++import { afterEach, describe, expect, it, vi } from "vitest";
++import { fireEvent, render, screen, waitFor } from "@testing-library/react";
++import { QueryClient, QueryClientProvider, useQuery } from "@tanstack/react-query";
++import { PluginPageVisibility } from "./PluginPageVisibility";
++import { PluginSettings } from "./PluginSettings";
++import { api } from "@/lib/api";
++import type { PluginSetting, PluginSummary } from "@/lib/api";
++import { menuLayout } from "@/lib/menu";
++
++const setting = (key: string): PluginSetting => ({ key, label: key, type: "string", required: true,
++  help: null, default: null, options: [], min: null, max: null, value: "original", set: true });
++const plugin = { id: "withings", enabled: true, settings: [setting("client_id"), setting("another")],
++  menu: [{ id: "withings", label: "Withings", icon: "bed", refresh_every: null }] } as PluginSummary;
++afterEach(() => vi.restoreAllMocks());
++
++function visibility() {
++  const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
++  function Host() {
++    const config = useQuery({ queryKey: ["config"], queryFn: api.getConfig });
++    const layout = menuLayout(config.data?.effective, false, ["withings.withings"]);
++    return <><PluginPageVisibility plugin={plugin} effective={config.data?.effective} />
++      {layout.main.filter((p) => !p.hidden).map((p) => <a key={p.id}>{p.id}</a>)}</>;
++  }
++  return render(<QueryClientProvider client={client}><Host /></QueryClientProvider>);
++}
++
++describe("settings alignment", () => {
++  it("saves only the input beside the submitted button, retaining another draft", async () => {
++    const patch = vi.spyOn(api, "patchConfig").mockResolvedValue({} as never);
++    render(<PluginSettings plugin={plugin} rooms={[]} onSaved={() => {}} />);
++    fireEvent.change(screen.getByRole("textbox", { name: "client_id" }), { target: { value: "new-id" } });
++    fireEvent.change(screen.getByRole("textbox", { name: "another" }), { target: { value: "unsaved" } });
++    fireEvent.click(screen.getByRole("button", { name: "Save client_id" }));
++    await waitFor(() => expect(patch).toHaveBeenCalledWith({ plugins: { withings: { client_id: "new-id" } } }));
++    expect(screen.getByRole("textbox", { name: "another" })).toHaveValue("unsaved");
++    expect(await screen.findByRole("status")).toHaveTextContent("Saved.");
++  });
++  it("keeps validation and failed-save feedback", async () => {
++    const patch = vi.spyOn(api, "patchConfig").mockRejectedValue(new Error("Save failed"));
++    render(<PluginSettings plugin={{ ...plugin, settings: [{ ...setting("client_id"), type: "number", value: 3 }] }} rooms={[]} onSaved={() => {}} />);
++    fireEvent.change(screen.getByRole("textbox", { name: "client_id" }), { target: { value: "invalid-number" } });
++    fireEvent.click(screen.getByRole("button", { name: "Save client_id" }));
++    expect(patch).not.toHaveBeenCalled();
++    expect(screen.getByRole("alert")).toBeInTheDocument();
++    fireEvent.change(screen.getByRole("textbox", { name: "client_id" }), { target: { value: "7" } });
++    fireEvent.click(screen.getByRole("button", { name: "Save client_id" }));
++    expect(await screen.findByText("Save failed")).toBeInTheDocument();
++    expect(screen.queryByRole("status")).not.toBeInTheDocument();
++  });
++  it("persists hiding/showing, preserves other entries and never disables the plugin", async () => {
++    let effective = { menu: { hidden: ["other.page"] } };
++    vi.spyOn(api, "getConfig").mockImplementation(async () => ({ effective }) as never);
++    const patch = vi.spyOn(api, "patchConfig").mockImplementation(async (body) => {
++      effective = body as typeof effective; return {} as never;
++    });
++    const view = visibility();
++    const toggle = await screen.findByRole("switch", { name: "Show Withings page" });
++    await waitFor(() => expect(toggle).not.toHaveAttribute("aria-disabled", "true"));
++    fireEvent.click(toggle);
++    await waitFor(() => expect(toggle).not.toBeChecked());
++    expect(patch).toHaveBeenLastCalledWith({ menu: { hidden: ["other.page", "withings.withings"] } });
++    expect(screen.queryByText("withings.withings")).not.toBeInTheDocument();
++    view.unmount(); visibility();
++    const reopened = screen.getByRole("switch");
++    await waitFor(() => expect(reopened).not.toHaveAttribute("aria-disabled", "true"));
++    expect(reopened).not.toBeChecked();
++    fireEvent.click(reopened);
++    await waitFor(() => expect(reopened).toBeChecked());
++    expect(patch).toHaveBeenLastCalledWith({ menu: { hidden: ["other.page"] } });
++    expect(screen.getByText("withings.withings")).toBeInTheDocument();
++    expect(plugin.enabled).toBe(true);
++  });
++  it("leaves visibility unchanged on write failure", async () => {
++    vi.spyOn(api, "getConfig").mockResolvedValue({ effective: { menu: { hidden: [] } } } as never);
++    vi.spyOn(api, "patchConfig").mockRejectedValue(new Error("Write refused"));
++    visibility();
++    const toggle = screen.getByRole("switch");
++    await waitFor(() => expect(toggle).not.toHaveAttribute("aria-disabled", "true"));
++    fireEvent.click(toggle);
++    expect(await screen.findByRole("alert")).toHaveTextContent("Write refused");
++    expect(toggle).toBeChecked();
++  });
++});
+diff --git a/web/src/components/Plugins.test.tsx b/web/src/components/Plugins.test.tsx
+index 9f14bab..1533cde 100644
+--- a/web/src/components/Plugins.test.tsx
++++ b/web/src/components/Plugins.test.tsx
+@@ -220,7 +220,7 @@ describe("installed plugins on Connected", () => {
+     expect(within(custom).getAllByRole("button")).toHaveLength(rows.length);
+   });
+ 
+-  it("open on their source, version and install date, and switch off", async () => {
++  it("omit the metadata block while retaining enablement controls", async () => {
+     const off = vi
+       .spyOn(api, "setPluginEnabled")
+       .mockResolvedValue({ ...PLUGIN, enabled: false, status: "disabled" });
+@@ -228,9 +228,10 @@ describe("installed plugins on Connected", () => {
+     fireEvent.click(screen.getByRole("button", { name: "Configure Spot prices" }));
+ 
+     const dialog = await screen.findByRole("dialog");
+-    expect(within(dialog).getByRole("link", { name: "github.com/jane/niles-spotprice" })).toBeInTheDocument();
+-    expect(within(dialog).getByText("0.1.0")).toBeInTheDocument();
+-    expect(within(dialog).getByText("Installed")).toBeInTheDocument();
++    expect(within(dialog).queryByRole("link", { name: "github.com/jane/niles-spotprice" })).toBeNull();
++    for (const label of ["Status", "From", "Version", "By", "Installed"]) {
++      expect(within(dialog).queryByText(label, { exact: true })).toBeNull();
++    }
+     expect(within(dialog).queryByRole("button", { name: /Roll back/ })).toBeNull();
+ 
+     fireEvent.click(within(dialog).getByRole("button", { name: "Turn off" }));
+@@ -496,7 +497,8 @@ describe("the generated setup panel", () => {
+       status_line: "Working",
+       settings: SETTINGS.map((s) => (s.key === "api_key" ? { ...s, set: true } : s)),
+     });
+-    expect(within(dialog).getByText("Working")).toBeInTheDocument();
++    expect(within(dialog).queryByText("Working")).toBeNull();
++    expect(within(dialog).queryByText(/Not set up/)).toBeNull();
+   });
+ 
+   it("saves what changed through PATCH /config, and an emptied field as its default", async () => {
+@@ -510,12 +512,16 @@ describe("the generated setup panel", () => {
+       target: { value: "" },
+     });
+     fireEvent.click(within(settings).getByRole("switch", { name: "Say when it is cheap" }));
+-    fireEvent.click(within(settings).getAllByRole("button", { name: "Save" })[0]);
+-    await waitFor(() =>
+-      expect(patch).toHaveBeenCalledWith({
+-        plugins: { spotprice: { label: "Strøm", cheap_hours: null, speak: true } },
+-      }),
+-    );
++    for (const [label, change] of [
++      ["Label", { label: "Strøm" }],
++      ["Cheap hours", { cheap_hours: null }],
++      ["Say when it is cheap", { speak: true }],
++    ] as const) {
++      const save = within(settings).getByRole("button", { name: `Save ${label}` });
++      await waitFor(() => expect(save).not.toBeDisabled());
++      fireEvent.click(save);
++      await waitFor(() => expect(patch).toHaveBeenCalledWith({ plugins: { spotprice: change } }));
++    }
+     await waitFor(() => expect(onPluginsChanged).toHaveBeenCalled());
+   });
+ 
+@@ -526,7 +532,7 @@ describe("the generated setup panel", () => {
+     fireEvent.change(within(settings).getByRole("textbox", { name: "Cheap hours" }), {
+       target: { value: "30" },
+     });
+-    fireEvent.click(within(settings).getAllByRole("button", { name: "Save" })[0]);
++    fireEvent.click(within(settings).getByRole("button", { name: "Save Cheap hours" }));
+     expect(
+       await within(settings).findByText("Cheap hours is between 1 and 24."),
+     ).toBeInTheDocument();
