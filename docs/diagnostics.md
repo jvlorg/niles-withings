@@ -2,7 +2,7 @@
 
 ## Delivery and evidence boundary
 
-Implemented in the standalone add-on, not Niles core. The journal uses the existing host-managed persistent key/value store. It is published and installed as **alpha.11 on test Niles only**. Production is unchanged. Connected operation is currently blocked by a pre-existing unresolved account refresh.
+Implemented in the standalone add-on, not Niles core. The journal uses the existing host-managed persistent key/value store. It is published and installed as **alpha.12 on test Niles only**. Production is unchanged. Approved reauthorization recovered the connection; actual bed-entry/exit processing and publication are recorded.
 
 The canonical delivery adapter emits a typed observation after applying its existing reducer and after each actual persistence/publication result. The component buffers at most two observations, then writes receipt/decision/result records **after essential state and actions**. There is no second diagnostic parser or reducer and no inference of publication from HTTP 200.
 
@@ -27,7 +27,7 @@ The 528 KiB cap leaves 496 KiB below the shared quota, but no fixed reserve can 
 
 ## Inspect/export
 
-Use the existing add-on tool `withings_diagnostics_export`. The pinned host exposes it as `withings_withings_diagnostics_export` in its global tool catalogue. This is a supported JSON tool, **not a new web download button**.
+Use the existing add-on tool `withings_diagnostics_export`. The pinned host exposes it as `withings_withings_diagnostics_export` in its global tool catalogue. Alpha.12 also provides an opt-in **Read diagnostic journal** button on the Withings surface. It uses this canonical export function, renders 25 records per JSON page, provides Next and Hide controls, and rejects stale snapshots. Copy the JSON pages for export; there is no browser-file download API.
 
 First request:
 
@@ -47,10 +47,10 @@ Read `total`, `oldest`, `newest`, `used_bytes`, `truncation_count`, `suppression
 
 ## Verified / not yet verified
 
-Main's final local gates: **132 workspace tests**, formatting, strict all-target Clippy, release Wasm build, fresh replay, positive and deliberately failing runtime checks. Actual component tests include callback, two mats, same-second correlations, duplicate/restart silence, failed reading/action publication, diagnostic-write independence, hourly health/failure recovery, malformed floods, read-only token-guarded export and real delivery under a host-rule quota-enforcing test store.
+Main's final local gates: **133 workspace tests**, formatting, strict all-target Clippy, release Wasm build, fresh replay, positive and deliberately failing runtime checks. Actual component tests include callback, two mats, same-second correlations, duplicate/restart silence, failed reading/action publication, diagnostic-write independence, hourly health/failure recovery, malformed floods, read-only token-guarded export and real delivery under a host-rule quota-enforcing test store.
 
 The maintained `scripts/verify-niles03-host.sh` runs the real pinned Niles checker, loads/renders the disconnected component, then starts a second dev-host process and exports both retained startup records. This is actual local host/file-backed process-restart proof, not connected production proof.
 
-Alpha.11 was installed using the normal hash-verified update flow with no added permissions. All four prior ordinary-storage entries and encrypted-secret rows survived unchanged. A full test-host restart retained its PostgreSQL journal record and added a second startup record. The pre-update account record already had an unresolved refresh-pending marker, so account restoration is blocked; no credentials or markers were changed. Temporary outbound was closed, dry-run preserved and health verified. Still pending: approved account recovery, ongoing provider access, live callback observation, live assistant tool export, journal retention across a subsequent version update, and the household test.
+Alpha.11 was installed using the normal hash-verified update flow with no added permissions. All four prior ordinary-storage entries and encrypted-secret rows survived unchanged. A full test-host restart retained its PostgreSQL journal record and added a second startup record. The pre-update account record already had an unresolved refresh-pending marker, so account restoration is blocked; no credentials or markers were changed. Temporary outbound was closed, dry-run preserved and health verified. Subsequently, approved reauthorization and ongoing provider access restored readiness; real bed-entry/exit publication was recorded. Alpha.11→12 retained the journal and ordinary state, and the actual installed UI exported all 12 records without storage writes. Automatic refresh/restart acceptance is scheduled; live assistant orchestration and the household test remain distinct from the installed UI export proof.
 
 Niles automation execution remains a separate evidence gap: the inspected host retains only its last 20 runs per automation in memory, and the add-on interface exposes no attributable started/completed/failed automation hook. Successful `action_published` does **not** prove an automation ran.
