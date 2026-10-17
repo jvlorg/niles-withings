@@ -1,6 +1,7 @@
 id = "withings"
 name = "Withings"
-version = "0.1.0-alpha.9"
+logo = "logo.svg"
+version = "0.1.0-alpha.10"
 authors = ["Johan Volmers Leth"]
 description = "Withings Sleep bed-presence status and account callbacks."
 keywords = ["withings", "bed", "sleep", "presence"]
